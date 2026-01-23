@@ -34,7 +34,7 @@ APPDEPLOY_TARGET=${APPDEPLOY_TARGET:-/opt/apps}
 # ============================================================================
 
 function appdeploy_log() {
-	local prefix="--- "
+	local prefix="_._"
 	printf '%s %s\n' "$prefix" "$*"
 }
 
@@ -44,7 +44,7 @@ function appdeploy_warn() {
 }
 
 function appdeploy_error() {
-	local prefix="[!]"
+	local prefix="~!~"
 	printf '%s %s\n' "$prefix" "$*"
 }
 
