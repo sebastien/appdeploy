@@ -116,6 +116,11 @@ dest="$TEST_PATH/nested/dir/hello-service-2.0.0.tar.gz"
 appdeploy_package_create "$EXAMPLES_DIR" "$dest" >/dev/null
 test-exist "$dest" "Package created in nested directory"
 
+# -----------------------------------------------------------------------------
+# Cleanup readonly files before test-end
+# -----------------------------------------------------------------------------
+chmod -R u+w "$TEST_PATH/extract-gz" "$TEST_PATH/extract-bz2" "$TEST_PATH/extract-xz" 2>/dev/null || true
+
 test-end
 
 # EOF

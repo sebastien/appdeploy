@@ -285,6 +285,36 @@ function appdeploy_version_latest() {
 # 
 # ----------------------------------------------------------------------------
 
+# Function: appdeploy_version_infer [PATH]
+# Infers a version from git/jj commit hash or falls back to timestamp.
+# For git/jj, returns format: YYYYMMDD-{short_hash} for sortability.
+# For fallback, returns timestamp: YYYYMMDDHHMMSS
+function appdeploy_version_infer() {
+	local path="${1:-.}"
+	local version=""
+	
+	# Try git first
+	if command -v git &>/dev/null && git -C "$path" rev-parse HEAD &>/dev/null 2>&1; then
+		local hash
+		hash=$(git -C "$path" rev-parse --short HEAD 2>/dev/null)
+		local date
+		date=$(date +%Y%m%d)
+		version="${date}-${hash}"
+	# Try jj (Jujutsu)
+	elif command -v jj &>/dev/null && jj -R "$path" log -r @ --no-graph -T 'commit_id.short()' &>/dev/null 2>&1; then
+		local hash
+		hash=$(jj -R "$path" log -r @ --no-graph -T 'commit_id.short()' 2>/dev/null)
+		local date
+		date=$(date +%Y%m%d)
+		version="${date}-${hash}"
+	else
+		# Fallback to timestamp
+		version=$(date +%Y%m%d%H%M%S)
+	fi
+	
+	printf '%s' "$version"
+}
+
 # Function: appdeploy_cmd_run TARGET COMMAND [ARGS...]
 # Runs COMMAND with ARGS on TARGET via SSH, in the target path, unless TARGET
 # has no host part, in which case runs locally.
@@ -1037,12 +1067,15 @@ function appdeploy_package_deploy_conf() {
 	fi
 }
 
-# Function: appdeploy_package_create SOURCE DESTINATION
+# Function: appdeploy_package_create SOURCE DESTINATION [FORCE]
 # Creates a package from the given SOURCE directory, placing the package
 # tarball as DESTINATION. DESTINATION must be like `${NAME}-${VERSION}.tar.[gz|bz2|xz]`
+# If FORCE is "true", overwrites existing destination file.
+# All files in the package are made readonly (preserving +x flags).
 function appdeploy_package_create () {
 	local source="$1"
 	local destination="$2"
+	local force="${3:-false}"
 	
 	if [[ ! -d "$source" ]]; then
 		appdeploy_error "Package directory does not exist: $source"
@@ -1087,6 +1120,12 @@ function appdeploy_package_create () {
 		return 1
 	fi
 	
+	# Check if destination exists (fail unless force=true)
+	if [[ -e "$destination" && "$force" != "true" ]]; then
+		appdeploy_error "Destination already exists: $destination (use -f/--force to overwrite)"
+		return 1
+	fi
+	
 	# Determine compression based on extension
 	local tar_opts=""
 	case "$destination" in
@@ -1098,20 +1137,150 @@ function appdeploy_package_create () {
 	esac
 	
 	# Ensure destination directory exists
-	local dest_dir=$(dirname "$destination")
+	local dest_dir
+	dest_dir=$(dirname "$destination")
 	if [[ -n "$dest_dir" && "$dest_dir" != "." ]]; then
 		mkdir -p "$dest_dir"
 	fi
 	
 	appdeploy_log "Creating package $name-$version from $source"
 	
-	# Create the tarball from the source directory contents
-	if ! tar $tar_opts "$destination" -C "$source" .; then
-		appdeploy_error "Failed to create package"
+	# Create staging directory for readonly copy
+	local staging
+	staging=$(mktemp -d) || {
+		appdeploy_error "Failed to create staging directory"
+		return 1
+	}
+	
+	# Copy source to staging
+	if ! cp -a "$source/." "$staging/"; then
+		appdeploy_error "Failed to copy source to staging directory"
+		chmod -R u+w "$staging" 2>/dev/null || true
+		rm -rf "$staging"
 		return 1
 	fi
 	
+	# Make all files readonly, preserving +x flag
+	# Files: readable by all, executable only if originally executable
+	while IFS= read -r -d '' file; do
+		if [[ -x "$file" ]]; then
+			chmod 555 "$file"  # r-xr-xr-x
+		else
+			chmod 444 "$file"  # r--r--r--
+		fi
+	done < <(find "$staging" -type f -print0)
+	
+	# Make directories readonly (r-xr-xr-x)
+	find "$staging" -type d -exec chmod 555 {} \;
+	
+	# Create the tarball from the staging directory contents
+	if ! tar $tar_opts "$destination" -C "$staging" .; then
+		appdeploy_error "Failed to create package"
+		chmod -R u+w "$staging" 2>/dev/null || true
+		rm -rf "$staging"
+		return 1
+	fi
+	
+	# Cleanup staging directory
+	chmod -R u+w "$staging" 2>/dev/null || true
+	rm -rf "$staging"
+	
 	appdeploy_log "Successfully created package: $destination"
+}
+
+# Function: appdeploy_package PATH [VERSION|OUTPUT] [-f|--force]
+# Creates an appdeploy package from PATH with auto-inferred name/version.
+# - NAME is inferred from the basename of PATH
+# - VERSION can be specified explicitly, or is inferred from git/jj commit or timestamp
+# - OUTPUT can be a full path matching NAME-VERSION.tar.[gz|bz2|xz] format
+# - If only VERSION is given, output is written to current directory as NAME-VERSION.tar.gz
+function appdeploy_package() {
+	local path=""
+	local version_or_output=""
+	local force="false"
+	
+	# Parse arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-f|--force)
+				force="true"
+				shift
+				;;
+			-*)
+				appdeploy_error "Unknown option: $1"
+				return 1
+				;;
+			*)
+				if [[ -z "$path" ]]; then
+					path="$1"
+				elif [[ -z "$version_or_output" ]]; then
+					version_or_output="$1"
+				else
+					appdeploy_error "Too many arguments"
+					return 1
+				fi
+				shift
+				;;
+		esac
+	done
+	
+	# Validate path argument
+	if [[ -z "$path" ]]; then
+		appdeploy_error "Usage: appdeploy package PATH [VERSION|OUTPUT] [-f|--force]"
+		return 1
+	fi
+	
+	if [[ ! -d "$path" ]]; then
+		appdeploy_error "Path does not exist or is not a directory: $path"
+		return 1
+	fi
+	
+	# Infer name from basename of path
+	local name
+	name=$(basename "$(realpath "$path")")
+	
+	if ! appdeploy_validate_name "$name"; then
+		appdeploy_error "Cannot infer valid package name from path: $path"
+		return 1
+	fi
+	
+	# Determine output path and version
+	local output=""
+	local version=""
+	
+	if [[ -n "$version_or_output" ]]; then
+		# Check if it looks like a full output path (contains .tar.)
+		if [[ "$version_or_output" =~ \.tar\.(gz|bz2|xz)$ ]]; then
+			output="$version_or_output"
+			# Validate it matches expected format
+			local parsed_name
+			parsed_name=$(appdeploy_package_name "$(basename "$output")") || true
+			if [[ -z "$parsed_name" ]]; then
+				appdeploy_error "Invalid output format: $output (expected NAME-VERSION.tar.[gz|bz2|xz])"
+				return 1
+			fi
+		else
+			# Treat as version
+			version="$version_or_output"
+			if ! appdeploy_validate_version "$version"; then
+				return 1
+			fi
+		fi
+	fi
+	
+	# Infer version if not set
+	if [[ -z "$version" && -z "$output" ]]; then
+		version=$(appdeploy_version_infer "$path")
+		appdeploy_log "Inferred version: $version"
+	fi
+	
+	# Build output path if not set (default: current directory, .tar.gz)
+	if [[ -z "$output" ]]; then
+		output="${name}-${version}.tar.gz"
+	fi
+	
+	# Call the core create function
+	appdeploy_package_create "$path" "$output" "$force"
 }
 
 # Function: appdeploy_package_run TARGET PACKAGE_ARCHIVE [CONF_ARCHIVE] [DRY_RUN] [OVERLAY_PATHS...]
@@ -1451,23 +1620,30 @@ function appdeploy_cli() {
 		package)
 			# Handle package subcommands
 			if [[ $# -eq 0 ]]; then
-				appdeploy_error "Missing package subcommand"
+				appdeploy_error "Usage: appdeploy package PATH [VERSION|OUTPUT] [-f|--force]"
+				appdeploy_error "       appdeploy package create SOURCE DESTINATION"
 				return 1
 			fi
 			local package_subcommand="$1"
-			shift
 			case "$package_subcommand" in
 				create)
-					# appdeploy package create SOURCE DESTINATION
+					# Legacy: appdeploy package create SOURCE DESTINATION
+					shift
 					if [[ $# -lt 2 ]]; then
 						appdeploy_error "Usage: appdeploy package create SOURCE DESTINATION"
 						return 1
 					fi
 					appdeploy_package_create "$1" "$2"
 				;;
+				-f|--force|-*)
+					# New: appdeploy package PATH [VERSION|OUTPUT] [-f|--force]
+					# Flags can appear anywhere, pass all args to appdeploy_package
+					appdeploy_package "$@"
+				;;
 				*)
-					appdeploy_error "Unknown package subcommand: $package_subcommand"
-					return 1
+					# New: appdeploy package PATH [VERSION|OUTPUT] [-f|--force]
+					# First arg is PATH, pass all args to appdeploy_package
+					appdeploy_package "$@"
 				;;
 			esac
 		;;
@@ -1527,6 +1703,7 @@ function appdeploy_cli() {
 		--help|-h|help)
 			echo "Usage: appdeploy [--version] [--help]"
 			echo "       appdeploy run PACKAGE_ARCHIVE [-c CONF_ARCHIVE] [-r RUN_PATH] [OVERLAY_PATHS...]"
+			echo "       appdeploy package PATH [VERSION|OUTPUT] [-f|--force]"
 			echo "       appdeploy package create SOURCE DESTINATION"
 			echo "       appdeploy target install TARGET"
 			echo "       appdeploy target check TARGET"
