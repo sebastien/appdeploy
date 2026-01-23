@@ -30,6 +30,108 @@ APPDEPLOY_VERSION="0.1.0"
 APPDEPLOY_TARGET=${APPDEPLOY_TARGET:-/opt/apps}
 
 # ============================================================================
+# SECURITY HELPERS
+# ============================================================================
+
+# Function: appdeploy_validate_name NAME
+# Validates that NAME contains only safe characters (alphanumeric, dash, underscore)
+# Returns 0 if valid, 1 if invalid
+function appdeploy_validate_name() {
+	local name="$1"
+	if [[ -z "$name" ]]; then
+		return 1
+	fi
+	# Only allow alphanumeric, dash, underscore, and dot
+	if [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+		appdeploy_error "Invalid name: '$name' (only alphanumeric, dash, underscore, dot allowed)"
+		return 1
+	fi
+	# Prevent path traversal attempts
+	if [[ "$name" == *".."* || "$name" == "."* ]]; then
+		appdeploy_error "Invalid name: '$name' (path traversal not allowed)"
+		return 1
+	fi
+	# Limit length
+	if [[ ${#name} -gt 128 ]]; then
+		appdeploy_error "Invalid name: '$name' (exceeds 128 characters)"
+		return 1
+	fi
+	return 0
+}
+
+# Function: appdeploy_validate_version VERSION
+# Validates that VERSION is a valid semver-like version string
+# Returns 0 if valid, 1 if invalid
+function appdeploy_validate_version() {
+	local version="$1"
+	if [[ -z "$version" ]]; then
+		return 1
+	fi
+	# Only allow semver-like versions: digits, dots, dashes, alphanumeric suffixes
+	if [[ ! "$version" =~ ^[0-9][0-9a-zA-Z._-]*$ ]]; then
+		appdeploy_error "Invalid version: '$version' (must start with digit, contain only alphanumeric, dot, dash, underscore)"
+		return 1
+	fi
+	# Prevent path traversal
+	if [[ "$version" == *".."* ]]; then
+		appdeploy_error "Invalid version: '$version' (path traversal not allowed)"
+		return 1
+	fi
+	# Limit length
+	if [[ ${#version} -gt 64 ]]; then
+		appdeploy_error "Invalid version: '$version' (exceeds 64 characters)"
+		return 1
+	fi
+	return 0
+}
+
+# Function: appdeploy_validate_path PATH
+# Validates that PATH is a safe absolute path without traversal
+# Returns 0 if valid, 1 if invalid
+function appdeploy_validate_path() {
+	local path="$1"
+	if [[ -z "$path" ]]; then
+		return 1
+	fi
+	# Must be absolute path
+	if [[ "$path" != /* ]]; then
+		appdeploy_error "Invalid path: '$path' (must be absolute)"
+		return 1
+	fi
+	# Prevent path traversal
+	if [[ "$path" == *".."* ]]; then
+		appdeploy_error "Invalid path: '$path' (path traversal not allowed)"
+		return 1
+	fi
+	# Only allow safe characters in paths
+	if [[ ! "$path" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+		appdeploy_error "Invalid path: '$path' (contains unsafe characters)"
+		return 1
+	fi
+	return 0
+}
+
+# Function: appdeploy_escape_single_quotes STRING
+# Escapes single quotes in STRING for safe use in single-quoted shell strings
+function appdeploy_escape_single_quotes() {
+	local str="$1"
+	printf '%s' "${str//\'/\'\\\'\'}"
+}
+
+# Function: appdeploy_make_temp_file [SUFFIX]
+# Creates a secure temporary file and returns its path
+function appdeploy_make_temp_file() {
+	local suffix="${1:-}"
+	local tmpfile
+	tmpfile=$(mktemp "/tmp/appdeploy.XXXXXXXXXX${suffix}") || {
+		appdeploy_error "Failed to create temporary file"
+		return 1
+	}
+	chmod 600 "$tmpfile"
+	printf '%s' "$tmpfile"
+}
+
+# ============================================================================
 # LOGGING
 # ============================================================================
 
@@ -152,6 +254,7 @@ function appdeploy_version_latest() {
 # Function: appdeploy_cmd_run TARGET COMMAND [ARGS...]
 # Runs COMMAND with ARGS on TARGET via SSH, in the target path, unless TARGET
 # has no host part, in which case runs locally.
+# SECURITY: Commands are executed via bash -c with proper escaping
 function appdeploy_cmd_run() {
 	local user=$(appdeploy_target_user "$1")
 	local host=$(appdeploy_target_host "$1")
@@ -160,14 +263,27 @@ function appdeploy_cmd_run() {
 	local cmd="$*"
 	local out
 	
+	# Validate path to prevent injection
+	if [[ -n "$path" ]] && ! appdeploy_validate_path "$path"; then
+		appdeploy_error "Invalid target path: $path"
+		return 1
+	fi
+	
+	# Escape the path for safe use in single quotes
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
 	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
-		# Run locally (disable xtrace to avoid trace output in captured result)
-		if ! out=$(set +x; cd "$path" && eval "$cmd" 2>&1); then
+		# Run locally using bash -c instead of eval
+		# This provides better isolation than eval
+		if ! out=$(set +x; cd "$path" && bash -c "$cmd" 2>&1); then
 			return 1
 		fi
 	else
-		# Run via SSH
-		if ! out=$(ssh "${user}@${host}" "cd '$path';$cmd" 2>&1); then
+		# Run via SSH with proper escaping
+		# Use -- to prevent option injection, escape the command properly
+		local ssh_cmd="cd '${escaped_path}' && ${cmd}"
+		if ! out=$(ssh -o BatchMode=yes -- "${user}@${host}" "$ssh_cmd" 2>&1); then
 			return 1
 		fi
 	fi
@@ -179,7 +295,22 @@ function appdeploy_dir_ensure() {
 	local path=$(appdeploy_target_path "$1")
 	local user=$(appdeploy_target_user "$1")
 	local dir="$path/$2"
-	appdeploy_cmd_run "$1" "mkdir -p '$dir';chown $user:$user '$dir'"
+	
+	# Validate inputs
+	if ! appdeploy_validate_path "$dir"; then
+		return 1
+	fi
+	if ! appdeploy_validate_name "$user"; then
+		appdeploy_error "Invalid user: $user"
+		return 1
+	fi
+	
+	local escaped_dir
+	escaped_dir=$(appdeploy_escape_single_quotes "$dir")
+	local escaped_user
+	escaped_user=$(appdeploy_escape_single_quotes "$user")
+	
+	appdeploy_cmd_run "$1" "mkdir -p '${escaped_dir}' && chown '${escaped_user}:${escaped_user}' '${escaped_dir}'"
 }
 
 # Function: appdeploy_file_exists FILE [TARGET]
@@ -209,12 +340,19 @@ function appdeploy_package_upload() {
 	local version="${4:-$(appdeploy_package_version "$(basename "$package")")}"
 	local ext=$(appdeploy_package_ext "$(basename "$package")")
 	
+	# Validate inputs
 	if [[ -z "$name" ]]; then
 		appdeploy_error "Could not determine package name from: $package"
 		return 1
 	fi
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
 	if [[ -z "$version" ]]; then
 		appdeploy_error "Could not determine package version from: $package"
+		return 1
+	fi
+	if ! appdeploy_validate_version "$version"; then
 		return 1
 	fi
 	if [[ ! -f "$package" ]]; then
@@ -225,13 +363,20 @@ function appdeploy_package_upload() {
 	local user=$(appdeploy_target_user "$target")
 	local host=$(appdeploy_target_host "$target")
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local dest_dir="$path/$name/packages"
 	local dest_file="$name-$version.tar.$ext"
 	
 	appdeploy_log "Uploading $package to $target as $dest_file"
 	
 	# Ensure destination directory exists
-	appdeploy_cmd_run "$target" "mkdir -p '$dest_dir'"
+	local escaped_dest_dir
+	escaped_dest_dir=$(appdeploy_escape_single_quotes "$dest_dir")
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_dest_dir}'"
 	
 	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
 		# Local copy
@@ -259,27 +404,54 @@ function appdeploy_package_install() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided
+	if [[ -n "$version" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local user=$(appdeploy_target_user "$target")
 	local host=$(appdeploy_target_host "$target")
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local pkg_dir="$path/$name/packages"
 	local dist_dir="$path/$name/dist"
+	
+	# Escape for shell commands
+	local escaped_name escaped_pkg_dir escaped_dist_dir
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	escaped_pkg_dir=$(appdeploy_escape_single_quotes "$pkg_dir")
+	escaped_dist_dir=$(appdeploy_escape_single_quotes "$dist_dir")
 	
 	# If no version specified, find the latest
 	if [[ -z "$version" ]]; then
 		local versions
-		versions=$(appdeploy_cmd_run "$target" "ls -1 '$pkg_dir' 2>/dev/null | grep -E '^${name}-[0-9].*\.tar\.(gz|bz2|xz)$' | sed -E 's/^${name}-//;s/\.tar\.(gz|bz2|xz)$//'")
+		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_name}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_name}-//;s/\\.tar\\.(gz|bz2|xz)\$//'")
 		if [[ -z "$versions" ]]; then
 			appdeploy_error "No packages found for $name on $target"
 			return 1
 		fi
 		version=$(appdeploy_version_latest $versions)
+		# Validate the resolved version
+		if ! appdeploy_validate_version "$version"; then
+			return 1
+		fi
 		appdeploy_log "Resolved latest version: $version"
 	fi
 	
+	local escaped_version
+	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
 	# Find the package file
 	local pkg_file
-	pkg_file=$(appdeploy_cmd_run "$target" "ls -1 '$pkg_dir/${name}-${version}'.tar.* 2>/dev/null | head -1")
+	pkg_file=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}/${escaped_name}-${escaped_version}'.tar.* 2>/dev/null | head -1")
 	if [[ -z "$pkg_file" ]]; then
 		appdeploy_error "Package not found: $name-$version"
 		return 1
@@ -295,15 +467,19 @@ function appdeploy_package_install() {
 	esac
 	
 	# Check if already installed
-	if appdeploy_cmd_run "$target" "test -d '$dist_dir/$version'" 2>/dev/null; then
+	if appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
 		appdeploy_log "Package $name:$version is already installed"
 		return 0
 	fi
 	
 	appdeploy_log "Installing $name:$version"
 	
+	# Escape pkg_file for the command
+	local escaped_pkg_file
+	escaped_pkg_file=$(appdeploy_escape_single_quotes "$pkg_file")
+	
 	# Create dist directory and extract
-	appdeploy_cmd_run "$target" "mkdir -p '$dist_dir/$version' && tar $tar_opts '$pkg_file' -C '$dist_dir/$version'"
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_dist_dir}/${escaped_version}' && tar $tar_opts '${escaped_pkg_file}' -C '${escaped_dist_dir}/${escaped_version}'"
 	
 	if [[ $? -ne 0 ]]; then
 		appdeploy_error "Failed to extract package"
@@ -322,33 +498,63 @@ function appdeploy_package_activate() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided
+	if [[ -n "$version" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local user=$(appdeploy_target_user "$target")
 	local host=$(appdeploy_target_host "$target")
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local pkg_dir="$path/$name/packages"
 	local dist_dir="$path/$name/dist"
 	local var_dir="$path/$name/var"
 	local run_dir="$path/$name/run"
 	
+	# Escape for shell commands
+	local escaped_name escaped_pkg_dir escaped_dist_dir escaped_var_dir escaped_run_dir escaped_path
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	escaped_pkg_dir=$(appdeploy_escape_single_quotes "$pkg_dir")
+	escaped_dist_dir=$(appdeploy_escape_single_quotes "$dist_dir")
+	escaped_var_dir=$(appdeploy_escape_single_quotes "$var_dir")
+	escaped_run_dir=$(appdeploy_escape_single_quotes "$run_dir")
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
 	# If no version specified, find the latest installed or uploaded
 	if [[ -z "$version" ]]; then
 		# First check installed versions
 		local versions
-		versions=$(appdeploy_cmd_run "$target" "ls -1 '$dist_dir' 2>/dev/null | grep -E '^[0-9]'")
+		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9]'")
 		if [[ -z "$versions" ]]; then
 			# Fall back to uploaded packages
-			versions=$(appdeploy_cmd_run "$target" "ls -1 '$pkg_dir' 2>/dev/null | grep -E '^${name}-[0-9].*\.tar\.(gz|bz2|xz)$' | sed -E 's/^${name}-//;s/\.tar\.(gz|bz2|xz)$//'")
+			versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_name}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_name}-//;s/\\.tar\\.(gz|bz2|xz)\$//'")
 		fi
 		if [[ -z "$versions" ]]; then
 			appdeploy_error "No packages found for $name on $target"
 			return 1
 		fi
 		version=$(appdeploy_version_latest $versions)
+		# Validate the resolved version
+		if ! appdeploy_validate_version "$version"; then
+			return 1
+		fi
 		appdeploy_log "Resolved latest version: $version"
 	fi
 	
+	local escaped_version
+	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
 	# Ensure package is installed
-	if ! appdeploy_cmd_run "$target" "test -d '$dist_dir/$version'" 2>/dev/null; then
+	if ! appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
 		appdeploy_log "Package not installed, installing first..."
 		appdeploy_package_install "$target" "$name:$version"
 		if [[ $? -ne 0 ]]; then
@@ -360,19 +566,19 @@ function appdeploy_package_activate() {
 	appdeploy_log "Activating $name:$version"
 	
 	# Create run and var directories
-	appdeploy_cmd_run "$target" "mkdir -p '$run_dir' '$var_dir'"
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_run_dir}' '${escaped_var_dir}'"
 	
 	# Clear existing symlinks in run directory
-	appdeploy_cmd_run "$target" "find '$run_dir' -maxdepth 1 -type l -delete"
+	appdeploy_cmd_run "$target" "find '${escaped_run_dir}' -maxdepth 1 -type l -delete"
 	
 	# Create symlinks from dist/VERSION to run
-	appdeploy_cmd_run "$target" "for item in '$dist_dir/$version'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done; true"
+	appdeploy_cmd_run "$target" "for item in '${escaped_dist_dir}/${escaped_version}'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '${escaped_run_dir}/'; done; true"
 	
 	# Overlay symlinks from var to run (these take precedence)
-	appdeploy_cmd_run "$target" "for item in '$var_dir'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done; true"
+	appdeploy_cmd_run "$target" "for item in '${escaped_var_dir}'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '${escaped_run_dir}/'; done; true"
 	
 	# Store active version marker
-	appdeploy_cmd_run "$target" "echo '$version' > '$path/$name/.active'"
+	appdeploy_cmd_run "$target" "echo '${escaped_version}' > '${escaped_path}/${escaped_name}/.active'"
 	
 	appdeploy_log "Successfully activated $name:$version"
 }
@@ -386,13 +592,32 @@ function appdeploy_package_deactivate() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided
+	if [[ -n "$version" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local run_dir="$path/$name/run"
 	local active_file="$path/$name/.active"
 	
+	# Escape for shell commands
+	local escaped_run_dir escaped_active_file
+	escaped_run_dir=$(appdeploy_escape_single_quotes "$run_dir")
+	escaped_active_file=$(appdeploy_escape_single_quotes "$active_file")
+	
 	# Get currently active version
 	local active_version
-	active_version=$(appdeploy_cmd_run "$target" "cat '$active_file' 2>/dev/null" || true)
+	active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
 	
 	if [[ -z "$active_version" ]]; then
 		appdeploy_log "No active version for $name"
@@ -408,10 +633,10 @@ function appdeploy_package_deactivate() {
 	appdeploy_log "Deactivating $name:$active_version"
 	
 	# Remove all symlinks in run directory
-	appdeploy_cmd_run "$target" "find '$run_dir' -maxdepth 1 -type l -delete"
+	appdeploy_cmd_run "$target" "find '${escaped_run_dir}' -maxdepth 1 -type l -delete"
 	
 	# Remove active marker
-	appdeploy_cmd_run "$target" "rm -f '$active_file'"
+	appdeploy_cmd_run "$target" "rm -f '${escaped_active_file}'"
 	
 	appdeploy_log "Successfully deactivated $name:$active_version"
 }
@@ -425,18 +650,37 @@ function appdeploy_package_uninstall() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided
+	if [[ -n "$version" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local dist_dir="$path/$name/dist"
 	local active_file="$path/$name/.active"
 	
+	# Escape for shell commands
+	local escaped_dist_dir escaped_active_file
+	escaped_dist_dir=$(appdeploy_escape_single_quotes "$dist_dir")
+	escaped_active_file=$(appdeploy_escape_single_quotes "$active_file")
+	
 	# Get currently active version
 	local active_version
-	active_version=$(appdeploy_cmd_run "$target" "cat '$active_file' 2>/dev/null" || true)
+	active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
 	
 	# If no version specified, uninstall all versions
 	if [[ -z "$version" ]]; then
 		local versions
-		versions=$(appdeploy_cmd_run "$target" "ls -1 '$dist_dir' 2>/dev/null | grep -E '^[0-9]'")
+		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9]'")
 		if [[ -z "$versions" ]]; then
 			appdeploy_log "No installed versions for $name"
 			return 0
@@ -447,8 +691,11 @@ function appdeploy_package_uninstall() {
 		return 0
 	fi
 	
+	local escaped_version
+	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
 	# Check if version is installed
-	if ! appdeploy_cmd_run "$target" "test -d '$dist_dir/$version'" 2>/dev/null; then
+	if ! appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
 		appdeploy_log "$name:$version is not installed"
 		return 0
 	fi
@@ -462,7 +709,7 @@ function appdeploy_package_uninstall() {
 	appdeploy_log "Uninstalling $name:$version"
 	
 	# Remove the dist directory for this version
-	appdeploy_cmd_run "$target" "rm -rf '$dist_dir/$version'"
+	appdeploy_cmd_run "$target" "rm -rf '${escaped_dist_dir}/${escaped_version}'"
 	
 	appdeploy_log "Successfully uninstalled $name:$version (archive kept)"
 }
@@ -476,13 +723,32 @@ function appdeploy_package_remove() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided
+	if [[ -n "$version" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local pkg_dir="$path/$name/packages"
+	
+	# Escape for shell commands
+	local escaped_name escaped_pkg_dir
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	escaped_pkg_dir=$(appdeploy_escape_single_quotes "$pkg_dir")
 	
 	# If no version specified, remove all versions
 	if [[ -z "$version" ]]; then
 		local versions
-		versions=$(appdeploy_cmd_run "$target" "ls -1 '$pkg_dir' 2>/dev/null | grep -E '^${name}-[0-9].*\.tar\.(gz|bz2|xz)$' | sed -E 's/^${name}-//;s/\.tar\.(gz|bz2|xz)$//'")
+		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_name}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_name}-//;s/\\.tar\\.(gz|bz2|xz)\$//'")
 		if [[ -z "$versions" ]]; then
 			appdeploy_log "No packages found for $name"
 			return 0
@@ -493,13 +759,16 @@ function appdeploy_package_remove() {
 		return 0
 	fi
 	
+	local escaped_version
+	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
 	# Uninstall first (this handles deactivation too)
 	appdeploy_package_uninstall "$target" "$name:$version"
 	
 	appdeploy_log "Removing package archive for $name:$version"
 	
 	# Remove the package archive
-	appdeploy_cmd_run "$target" "rm -f '$pkg_dir/${name}-${version}'.tar.*"
+	appdeploy_cmd_run "$target" "rm -f '${escaped_pkg_dir}/${escaped_name}-${escaped_version}'.tar.*"
 	
 	appdeploy_log "Successfully removed $name:$version"
 }
@@ -516,11 +785,27 @@ function appdeploy_package_list() {
 	# Default to wildcard if no name given
 	[[ -z "$name" ]] && name="*"
 	
+	# Validate name if not wildcard
+	if [[ "$name" != "*" ]] && ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	# Validate version if provided and not wildcard
+	if [[ -n "$version" && "$version" != "*" ]] && ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
 	
 	# List all matching apps
 	local apps
-	apps=$(appdeploy_cmd_run "$target" "ls -1 '$path' 2>/dev/null | grep -v '^\.' || true")
+	apps=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_path}' 2>/dev/null | grep -v '^\\.' || true")
 	
 	if [[ -z "$apps" ]]; then
 		appdeploy_log "No packages found on $target"
@@ -531,6 +816,11 @@ function appdeploy_package_list() {
 	printf "%-20s %-15s %-10s %-10s\n" "-------" "-------" "------" "--------"
 	
 	for app in $apps; do
+		# Validate app name from filesystem to prevent injection
+		if ! appdeploy_validate_name "$app" 2>/dev/null; then
+			continue
+		fi
+		
 		# Check if app matches the pattern
 		if [[ "$name" != "*" && "$app" != $name ]]; then
 			continue
@@ -540,17 +830,24 @@ function appdeploy_package_list() {
 		local dist_dir="$path/$app/dist"
 		local active_file="$path/$app/.active"
 		
+		# Escape for shell commands
+		local escaped_app escaped_pkg_dir escaped_dist_dir escaped_active_file
+		escaped_app=$(appdeploy_escape_single_quotes "$app")
+		escaped_pkg_dir=$(appdeploy_escape_single_quotes "$pkg_dir")
+		escaped_dist_dir=$(appdeploy_escape_single_quotes "$dist_dir")
+		escaped_active_file=$(appdeploy_escape_single_quotes "$active_file")
+		
 		# Get active version
 		local active_version
-		active_version=$(appdeploy_cmd_run "$target" "cat '$active_file' 2>/dev/null" || true)
+		active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
 		
 		# List uploaded packages
 		local pkg_versions
-		pkg_versions=$(appdeploy_cmd_run "$target" "ls -1 '$pkg_dir' 2>/dev/null | grep -E '^${app}-[0-9].*\.tar\.(gz|bz2|xz)$' | sed -E 's/^${app}-//;s/\.tar\.(gz|bz2|xz)$//' || true")
+		pkg_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_app}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_app}-//;s/\\.tar\\.(gz|bz2|xz)\$//' || true")
 		
 		# List installed versions
 		local installed_versions
-		installed_versions=$(appdeploy_cmd_run "$target" "ls -1 '$dist_dir' 2>/dev/null | grep -E '^[0-9]' || true")
+		installed_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9]' || true")
 		
 		# Combine and deduplicate versions
 		local all_versions
@@ -561,6 +858,11 @@ function appdeploy_package_list() {
 		fi
 		
 		for v in $all_versions; do
+			# Validate version from filesystem
+			if ! appdeploy_validate_version "$v" 2>/dev/null; then
+				continue
+			fi
+			
 			# Filter by version if specified
 			if [[ -n "$version" && "$v" != $version ]]; then
 				continue
@@ -607,6 +909,11 @@ function appdeploy_package_deploy_conf() {
 	local parsed name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
 	if [[ ! -f "$conf_archive" ]]; then
 		appdeploy_error "Configuration archive does not exist: $conf_archive"
 		return 1
@@ -615,6 +922,11 @@ function appdeploy_package_deploy_conf() {
 	local user=$(appdeploy_target_user "$target")
 	local host=$(appdeploy_target_host "$target")
 	local path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	local var_dir="$path/$name/var"
 	
 	# Determine compression type
@@ -629,27 +941,46 @@ function appdeploy_package_deploy_conf() {
 	
 	appdeploy_log "Deploying configuration for $name"
 	
-	# Ensure var directory exists
-	appdeploy_cmd_run "$target" "mkdir -p '$var_dir'"
+	# Escape for shell commands
+	local escaped_var_dir
+	escaped_var_dir=$(appdeploy_escape_single_quotes "$var_dir")
 	
-	# Upload/copy the archive to a temp location
-	local temp_archive="/tmp/appdeploy_conf_$(date +%s).tar${conf_archive##*.tar}"
+	# Ensure var directory exists
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_var_dir}'"
+	
+	# Create secure temporary file using mktemp
+	local temp_archive
 	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+		# Local: use our secure temp file function
+		temp_archive=$(appdeploy_make_temp_file ".tar") || return 1
 		# Local copy
 		if ! cp "$conf_archive" "${temp_archive}"; then
+			rm -f "$temp_archive"
 			appdeploy_error "Failed to copy configuration archive"
 			return 1
 		fi
 	else
+		# Remote: create temp file on remote host using mktemp
+		temp_archive=$(appdeploy_cmd_run "$target" "mktemp /tmp/appdeploy_conf.XXXXXXXXXX.tar")
+		if [[ -z "$temp_archive" ]]; then
+			appdeploy_error "Failed to create temporary file on remote host"
+			return 1
+		fi
 		# Upload using rsync
 		if ! rsync -az "$conf_archive" "${user}@${host}:${temp_archive}"; then
+			appdeploy_cmd_run "$target" "rm -f '$(appdeploy_escape_single_quotes "$temp_archive")'"
 			appdeploy_error "Failed to upload configuration archive"
 			return 1
 		fi
 	fi
 	
-	# Extract to var directory
-	if ! appdeploy_cmd_run "$target" "tar $tar_opts '$temp_archive' -C '$var_dir' && rm -f '$temp_archive'"; then
+	local escaped_temp_archive
+	escaped_temp_archive=$(appdeploy_escape_single_quotes "$temp_archive")
+	
+	# Extract to var directory and clean up temp file
+	if ! appdeploy_cmd_run "$target" "tar $tar_opts '${escaped_temp_archive}' -C '${escaped_var_dir}' && rm -f '${escaped_temp_archive}'"; then
+		# Clean up on failure
+		appdeploy_cmd_run "$target" "rm -f '${escaped_temp_archive}'" 2>/dev/null || true
 		appdeploy_error "Failed to extract configuration archive"
 		return 1
 	fi
@@ -658,8 +989,10 @@ function appdeploy_package_deploy_conf() {
 	
 	# If package is active, re-activate to update symlinks
 	local active_file="$path/$name/.active"
+	local escaped_active_file
+	escaped_active_file=$(appdeploy_escape_single_quotes "$active_file")
 	local active_version
-	active_version=$(appdeploy_cmd_run "$target" "cat '$active_file' 2>/dev/null" || true)
+	active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
 	if [[ -n "$active_version" ]]; then
 		appdeploy_log "Re-activating $name:$active_version to apply configuration"
 		appdeploy_package_activate "$target" "$name:$active_version"
@@ -689,8 +1022,14 @@ function appdeploy_package_create () {
 		appdeploy_error "Invalid destination filename format: $destination (expected NAME-VERSION.tar.[gz|bz2|xz])"
 		return 1
 	fi
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
 	if [[ -z "$version" ]]; then
 		appdeploy_error "Could not determine version from: $destination (expected NAME-VERSION.tar.[gz|bz2|xz])"
+		return 1
+	fi
+	if ! appdeploy_validate_version "$version"; then
 		return 1
 	fi
 	
@@ -735,10 +1074,17 @@ function appdeploy_target_install() {
 	local user=$(appdeploy_target_user "$target")
 	local host=$(appdeploy_target_host "$target")
 	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
 	appdeploy_log "Installing appdeploy directory structure on $target"
 	
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
 	# Create base directory
-	appdeploy_cmd_run "$target" "mkdir -p '$path'"
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_path}'"
 	
 	appdeploy_log "Successfully installed appdeploy on $target at $path"
 }
@@ -750,8 +1096,15 @@ function appdeploy_target_check() {
 	local target="$1"
 	local path=$(appdeploy_target_path "$target")
 	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
 	# Check if base directory exists
-	if ! appdeploy_cmd_run "$target" "test -d '$path'" 2>/dev/null; then
+	if ! appdeploy_cmd_run "$target" "test -d '${escaped_path}'" 2>/dev/null; then
 		appdeploy_error "Target directory does not exist: $path"
 		appdeploy_log "Run 'appdeploy target install' first"
 		return 1
