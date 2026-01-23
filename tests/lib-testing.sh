@@ -421,7 +421,7 @@ function test-substring { # STRING STRING…
 	local str="$1"
 	shift
 	for expr in "$@"; do
-		if ! grep -q "$expr" <(echo "$str"); then
+		if ! grep -qF -- "$expr" <(echo "$str"); then
 			test-fail "'$str' does not contain: '$expr'"
 			return 1
 		fi

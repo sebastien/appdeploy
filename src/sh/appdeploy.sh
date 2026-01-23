@@ -64,15 +64,15 @@ function appdeploy_target_path() {
 }
 
 function appdeploy_package_name() {
-	[[ $1 =~ ^(.*)-[0-9].*\.[^.]+$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	[[ $1 =~ ^(.*)-[0-9].*\.tar\.(gz|bz2|xz)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 function appdeploy_package_version() { # $1 = filename
-	[[ $1 =~ ^.*-([0-9][^.]*)\.[^.]+$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	[[ $1 =~ ^.*-([0-9][0-9.a-zA-Z-]*)\.tar\.(gz|bz2|xz)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 function appdeploy_package_ext() { # $1 = filename
-	[[ $1 =~ \.([^.]+)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	[[ $1 =~ \.tar\.(gz|bz2|xz)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 # Function: appdeploy_package_parse PACKAGE_SPEC
@@ -159,11 +159,19 @@ function appdeploy_cmd_run() {
 	shift
 	local cmd="$*"
 	local out
-	if ! out=$(ssh "${user}@${host}" "cd '$path';$cmd" 2>&1); then
-		return 1
+	
+	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+		# Run locally (disable xtrace to avoid trace output in captured result)
+		if ! out=$(set +x; cd "$path" && eval "$cmd" 2>&1); then
+			return 1
+		fi
 	else
-		echo -n "$out"
+		# Run via SSH
+		if ! out=$(ssh "${user}@${host}" "cd '$path';$cmd" 2>&1); then
+			return 1
+		fi
 	fi
+	echo -n "$out"
 }
 # Function: appdeploy_dir_ensure TARGET
 # Ensures that the given PATH exists on TARGET, creating it if necessary.
@@ -193,6 +201,7 @@ function appdeploy_file_exists () {
 # Function: appdeploy_package_upload TARGET PACKAGE [NAME] [VERSION]
 # Uploads `PACKAGE` to `TARGET`, optionally renaming it to `NAME` and `VERSION`.
 # Names and versions are used to construct the filename as `NAME-VERSION.EXT`.
+# If TARGET has no host, performs a local copy instead of rsync over SSH.
 function appdeploy_package_upload() {
 	local target="$1"
 	local package="$2"
@@ -224,10 +233,18 @@ function appdeploy_package_upload() {
 	# Ensure destination directory exists
 	appdeploy_cmd_run "$target" "mkdir -p '$dest_dir'"
 	
-	# Upload using rsync
-	if ! rsync -az --progress "$package" "${user}@${host}:${dest_dir}/${dest_file}"; then
-		appdeploy_error "Failed to upload package"
-		return 1
+	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+		# Local copy
+		if ! cp "$package" "${dest_dir}/${dest_file}"; then
+			appdeploy_error "Failed to copy package"
+			return 1
+		fi
+	else
+		# Upload using rsync
+		if ! rsync -az --progress "$package" "${user}@${host}:${dest_dir}/${dest_file}"; then
+			appdeploy_error "Failed to upload package"
+			return 1
+		fi
 	fi
 	
 	appdeploy_log "Successfully uploaded $dest_file"
@@ -349,10 +366,10 @@ function appdeploy_package_activate() {
 	appdeploy_cmd_run "$target" "find '$run_dir' -maxdepth 1 -type l -delete"
 	
 	# Create symlinks from dist/VERSION to run
-	appdeploy_cmd_run "$target" "for item in '$dist_dir/$version'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done"
+	appdeploy_cmd_run "$target" "for item in '$dist_dir/$version'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done; true"
 	
 	# Overlay symlinks from var to run (these take precedence)
-	appdeploy_cmd_run "$target" "for item in '$var_dir'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done"
+	appdeploy_cmd_run "$target" "for item in '$var_dir'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '$run_dir/'; done; true"
 	
 	# Store active version marker
 	appdeploy_cmd_run "$target" "echo '$version' > '$path/$name/.active'"
@@ -582,6 +599,7 @@ function appdeploy_package_list() {
 # Function: appdeploy_conf_push TARGET PACKAGE[:VERSION] CONF_ARCHIVE
 # Uploads the given `CONF_ARCHIVE` (tarball) to `TARGET` and unpacks it
 # into the `var/` directory of the given `PACKAGE` (`VERSION` or latest).
+# If TARGET has no host, performs a local copy instead of rsync over SSH.
 function appdeploy_package_deploy_conf() {
 	local target="$1"
 	local spec="$2"
@@ -614,11 +632,20 @@ function appdeploy_package_deploy_conf() {
 	# Ensure var directory exists
 	appdeploy_cmd_run "$target" "mkdir -p '$var_dir'"
 	
-	# Upload the archive to a temp location
+	# Upload/copy the archive to a temp location
 	local temp_archive="/tmp/appdeploy_conf_$(date +%s).tar${conf_archive##*.tar}"
-	if ! rsync -az "$conf_archive" "${user}@${host}:${temp_archive}"; then
-		appdeploy_error "Failed to upload configuration archive"
-		return 1
+	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+		# Local copy
+		if ! cp "$conf_archive" "${temp_archive}"; then
+			appdeploy_error "Failed to copy configuration archive"
+			return 1
+		fi
+	else
+		# Upload using rsync
+		if ! rsync -az "$conf_archive" "${user}@${host}:${temp_archive}"; then
+			appdeploy_error "Failed to upload configuration archive"
+			return 1
+		fi
 	fi
 	
 	# Extract to var directory
@@ -741,9 +768,12 @@ function appdeploy_target_check() {
 # ----------------------------------------------------------------------------
 
 function appdeploy_cli() {
-	appdeploy_check $APPDEPLOY_TARGET
+	appdeploy_target_check ":$APPDEPLOY_TARGET"
 }
 
-appdeploy_cli "$@"
+# Only run CLI if script is executed directly (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	appdeploy_cli "$@"
+fi
 
 # EOF
