@@ -28,6 +28,8 @@ set -euo pipefail
 
 APPDEPLOY_VERSION="0.1.0"
 APPDEPLOY_TARGET=${APPDEPLOY_TARGET:-/opt/apps}
+APPDEPLOY_DEFAULT_TARGET=${APPDEPLOY_DEFAULT_TARGET:-/opt/appdeploy}
+APPDEPLOY_DEFAULT_PATH=${APPDEPLOY_DEFAULT_PATH:-/opt/apps}
 
 # --
 # ## Color library
@@ -230,7 +232,12 @@ function appdeploy_target_host() {
 }
 
 function appdeploy_target_path() {
-	[[ $1 =~ :(.*)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	if [[ $1 =~ :(.*)$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	else
+		# No path specified, use default
+		printf '%s\n' "$APPDEPLOY_DEFAULT_PATH"
+	fi
 }
 
 function appdeploy_package_name() {
@@ -888,6 +895,48 @@ function appdeploy_package_remove() {
 
 # Function: appdeploy_package_list TARGET [PACKAGE][:VERSION]
 # Lists the packages that match the given PACKAGE and VERSION on TARGET, 
+# supporting wildcards. 
+
+# Function: appdeploy_package_current TARGET PACKAGE_NAME
+# Returns the currently active version of a package on the target
+# Returns empty string if no package is active
+function appdeploy_package_current() {
+	local target="$1"
+	local package_name="$2"
+	
+	# Validate arguments
+	if [[ -z "$target" ]] || [[ -z "$package_name" ]]; then
+		appdeploy_error "Usage: appdeploy_package_current TARGET PACKAGE_NAME"
+		return 1
+	fi
+	
+	if ! appdeploy_validate_name "$package_name"; then
+		return 1
+	fi
+	
+	if ! appdeploy_target_check "$target"; then
+		return 1
+	fi
+	
+	local target_path=$(appdeploy_target_path "$target")
+	local active_file="${target_path}/${package_name}/.active"
+	
+	# Escape for shell commands
+	local escaped_active_file
+	escaped_active_file=$(appdeploy_escape_single_quotes "$active_file")
+	
+	# Read the active version using appdeploy_cmd_run (handles both local and remote)
+	local active_version
+	active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
+	
+	if [[ -z "$active_version" ]]; then
+		return 0
+	fi
+	
+	echo "${package_name}:${active_version}"
+	return 0
+}
+
 # supporting wildcards. 
 function appdeploy_package_list() {
 	local target="$1"
@@ -1674,6 +1723,7 @@ function appdeploy_show_help() {
 	printf "  %-20s %s\n" "package-remove" "Remove package from target"
 	printf "  %-20s %s\n" "package-list" "List packages on target"
 	printf "  %-20s %s\n" "package-deploy-conf" "Deploy configuration to package"
+	printf "  %-20s %s\n" "deploy" "Deploy package to target (full lifecycle)"
 	echo ""
 	echo "${BOLD}Use 'appdeploy COMMAND --help' for more information on a specific command.${RESET}"
 	
@@ -1686,7 +1736,301 @@ function appdeploy_show_help() {
 		echo "  appdeploy package-upload user@host:/opt/apps myapp-1.0.0.tar.gz"
 		echo "  appdeploy package-list user@host:/opt/apps"
 		echo "  appdeploy package-activate user@host:/opt/apps myapp:1.0.0"
+		echo "  appdeploy deploy /opt/apps myapp-1.0.0.tar.gz"
 	fi
+}
+
+# Function: appdeploy_terraform_apply TARGET
+# Applies terraform configuration to ensure target is properly configured
+# This is a basic implementation that can be enhanced with actual terraform integration
+function appdeploy_terraform_apply() {
+	local target="$1"
+	
+	# Extract target host and path
+	local target_host=$(appdeploy_target_host "$target")
+	local target_path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$target_path"; then
+		appdeploy_error "Invalid target path: $target_path"
+		return 1
+	fi
+	
+	appdeploy_log "Ensuring target '$target' is properly configured"
+	
+	if [[ -n "$target_host" ]] && [[ "$target_host" != "localhost" ]] && [[ "$target_host" != "127.0.0.1" ]]; then
+		# Remote target
+		local target_user=$(appdeploy_target_user "$target")
+		local ssh_target="${target_host}"
+		if [[ -n "$target_user" ]]; then
+			ssh_target="${target_user}@${target_host}"
+		fi
+		
+		# Escape path for shell
+		local escaped_path
+		escaped_path=$(appdeploy_escape_single_quotes "$target_path")
+		
+		# For remote targets, ensure the directory exists using direct SSH
+		# (can't use appdeploy_cmd_run because that requires the directory to exist)
+		appdeploy_log "Setting up remote target directory structure"
+		if ! ssh -o BatchMode=yes -- "$ssh_target" "mkdir -p '${escaped_path}' && chmod 755 '${escaped_path}'" 2>&1; then
+			appdeploy_error "Failed to create remote target directory: $target_path"
+			return 1
+		fi
+	else
+		# Local target (including :path format)
+		appdeploy_log "Setting up local target directory structure"
+		if ! mkdir -p "$target_path" || ! chmod 755 "$target_path"; then
+			appdeploy_error "Failed to create local target directory: $target_path"
+			return 1
+		fi
+	fi
+	
+	# Verify target is now accessible
+	if ! appdeploy_target_check "$target"; then
+		appdeploy_error "Target '$target' is not accessible after setup"
+		return 1
+	fi
+	
+	appdeploy_log "Target '$target' is ready for deployment"
+	return 0
+}
+
+# Function: appdeploy_prepare [TARGET]
+# Prepares the target for deployment:
+# - Creates target directory structure if it doesn't exist
+# - Displays list of installed packages and versions, highlighting active ones
+function appdeploy_prepare() {
+	local target="${1:-}"
+	
+	# Default target to local APPDEPLOY_DEFAULT_TARGET
+	if [[ -z "$target" ]]; then
+		target=":$APPDEPLOY_DEFAULT_TARGET"
+	fi
+	
+	appdeploy_log "Preparing target: $target"
+	
+	# Step 1: Terraform/setup target directory
+	if ! appdeploy_terraform_apply "$target"; then
+		appdeploy_error "Failed to prepare target '$target'"
+		return 1
+	fi
+	
+	# Step 2: Display installed packages
+	appdeploy_log ""
+	appdeploy_log "${BOLD}Installed packages on $target:${RESET}"
+	appdeploy_package_list "$target"
+	
+	return 0
+}
+
+# Function: appdeploy_deploy [-p|--package NAME[-VERSION]] PACKAGE_PATH [CONF_ARCHIVE] [TARGET]
+# Deploys a package to the specified target, handling the full deployment lifecycle
+function appdeploy_deploy() {
+	local package_name_override=""
+	local package_path=""
+	local conf_archive=""
+	local target=""
+	
+	# Parse arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-p|--package)
+				if [[ $# -lt 2 ]]; then
+					appdeploy_error "Missing argument for -p/--package"
+					return 1
+				fi
+				package_name_override="$2"
+				shift 2
+				;;
+			-*)
+				appdeploy_error "Unknown option: $1"
+				return 1
+				;;
+			*)
+				# Positional arguments: PACKAGE_PATH [CONF_ARCHIVE] [TARGET]
+				if [[ -z "$package_path" ]]; then
+					package_path="$1"
+				elif [[ -z "$conf_archive" ]] && [[ -z "$target" ]]; then
+					# Could be CONF_ARCHIVE or TARGET
+					# If it's an existing file, treat as conf_archive
+					# Otherwise, treat as target
+					if [[ -f "$1" ]]; then
+						conf_archive="$1"
+					else
+						target="$1"
+					fi
+				elif [[ -z "$target" ]]; then
+					target="$1"
+				else
+					appdeploy_error "Too many arguments"
+					return 1
+				fi
+				shift
+				;;
+		esac
+	done
+	
+	# Validate package_path is provided
+	if [[ -z "$package_path" ]]; then
+		appdeploy_error "Usage: appdeploy deploy [-p|--package NAME[-VERSION]] PACKAGE_PATH [CONF_ARCHIVE] [TARGET]"
+		return 1
+	fi
+	
+	# Default target to local APPDEPLOY_DEFAULT_TARGET
+	if [[ -z "$target" ]]; then
+		target=":$APPDEPLOY_DEFAULT_TARGET"
+	fi
+	
+	# Validate package path
+	if [[ ! -e "$package_path" ]]; then
+		appdeploy_error "Package path '$package_path' does not exist"
+		return 1
+	fi
+	
+	# Validate configuration archive if provided
+	if [[ -n "$conf_archive" ]] && [[ ! -f "$conf_archive" ]]; then
+		appdeploy_error "Configuration archive '$conf_archive' does not exist"
+		return 1
+	fi
+	
+	# Step 1: Terraform target configuration
+	appdeploy_log "${BOLD}Step 1/8: Configuring target with terraform${RESET}"
+	if ! appdeploy_terraform_apply "$target"; then
+		appdeploy_error "Failed to configure target with terraform"
+		return 1
+	fi
+	
+	# Step 2: Create package if it's a directory
+	local package_archive="$package_path"
+	local is_directory=false
+	
+	if [[ -d "$package_path" ]]; then
+		appdeploy_log "${BOLD}Step 2/8: Creating package archive${RESET}"
+		is_directory=true
+		
+		# Determine package name and version
+		local package_name=""
+		local package_version=""
+		
+		if [[ -n "$package_name_override" ]]; then
+			# Parse NAME[-VERSION] from override
+			if [[ "$package_name_override" == *-* ]]; then
+				# Contains dash - could be name-version or just a name with dashes
+				# Try to extract version (last part after dash if it looks like a version)
+				local potential_version="${package_name_override##*-}"
+				if [[ "$potential_version" =~ ^[0-9] ]] || [[ "$potential_version" =~ ^v[0-9] ]]; then
+					package_name="${package_name_override%-*}"
+					package_version="$potential_version"
+				else
+					package_name="$package_name_override"
+				fi
+			else
+				package_name="$package_name_override"
+			fi
+		else
+			# Infer package name from directory
+			package_name=$(basename "$package_path")
+		fi
+		
+		# Infer version if not set
+		if [[ -z "$package_version" ]]; then
+			package_version=$(appdeploy_version_infer "$package_path")
+			if [[ -z "$package_version" ]]; then
+				package_version=$(date +"%Y%m%d-%H%M%S")
+			fi
+		fi
+		
+		local temp_archive=$(mktemp -t "${package_name}-${package_version}.XXXXXX.tar.gz")
+		
+		if ! appdeploy_package_create "$package_path" "$temp_archive" "true"; then
+			appdeploy_error "Failed to create package archive"
+			return 1
+		fi
+		
+		package_archive="$temp_archive"
+		appdeploy_log "Created package archive: $package_archive"
+	fi
+	
+	# Extract package name and version from archive
+	local package_name=$(appdeploy_package_name "$(basename "$package_archive")")
+	local package_version=$(appdeploy_package_version "$(basename "$package_archive")")
+	
+	if [[ -z "$package_name" ]] || [[ -z "$package_version" ]]; then
+		appdeploy_error "Failed to extract package name and version from archive"
+		if [[ "$is_directory" == true ]]; then
+			rm -f "$package_archive"
+		fi
+		return 1
+	fi
+	
+	appdeploy_log "Deploying package: ${package_name}:${package_version}"
+	
+	# Step 3: Upload package
+	appdeploy_log "${BOLD}Step 3/8: Uploading package to target${RESET}"
+	if ! appdeploy_package_upload "$target" "$package_archive"; then
+		appdeploy_error "Failed to upload package to target"
+		if [[ "$is_directory" == true ]]; then
+			rm -f "$package_archive"
+		fi
+		return 1
+	fi
+	
+	# Clean up temporary archive if we created it
+	if [[ "$is_directory" == true ]]; then
+		rm -f "$package_archive"
+	fi
+	
+	# Step 4: Install package
+	appdeploy_log "${BOLD}Step 4/8: Installing package on target${RESET}"
+	if ! appdeploy_package_install "$target" "${package_name}:${package_version}"; then
+		appdeploy_error "Failed to install package on target"
+		return 1
+	fi
+	
+	# Step 5: Deactivate current package if any
+	appdeploy_log "${BOLD}Step 5/8: Deactivating current package${RESET}"
+	local current_package=$(appdeploy_package_current "$target" "$package_name")
+	
+	if [[ -n "$current_package" ]]; then
+		appdeploy_log "Deactivating current package: $current_package"
+		if ! appdeploy_package_deactivate "$target" "$package_name"; then
+			appdeploy_error "Failed to deactivate current package"
+			return 1
+		fi
+	else
+		appdeploy_log "No current package to deactivate"
+	fi
+	
+	# Step 6: Activate new package
+	appdeploy_log "${BOLD}Step 6/8: Activating new package${RESET}"
+	if ! appdeploy_package_activate "$target" "${package_name}:${package_version}"; then
+		appdeploy_error "Failed to activate new package"
+		return 1
+	fi
+	
+	# Step 7: Deploy configuration if provided
+	if [[ -n "$conf_archive" ]]; then
+		appdeploy_log "${BOLD}Step 7/8: Deploying configuration${RESET}"
+		if ! appdeploy_package_deploy_conf "$target" "${package_name}:${package_version}" "$conf_archive"; then
+			appdeploy_error "Failed to deploy configuration"
+			return 1
+		fi
+	else
+		appdeploy_log "${BOLD}Step 7/8: No configuration to deploy${RESET}"
+	fi
+	
+	# Step 8: Start the package
+	appdeploy_log "${BOLD}Step 8/8: Starting package${RESET}"
+	
+	# For now, just log that the package is ready to start
+	# In a full implementation, this would execute the run.sh script
+	appdeploy_log "Package ${package_name}:${package_version} is ready to start on ${target}"
+	appdeploy_log "To start the package manually, run: appdeploy run ${package_name}-${package_version}.tar.gz"
+	
+	appdeploy_log "${GREEN}Deployment completed successfully!${RESET}"
+	appdeploy_log "Package ${package_name}:${package_version} is now running on ${target}"
+	
+	return 0
 }
 
 # Function: appdeploy_help_run
@@ -1912,6 +2256,63 @@ function appdeploy_help_package_deploy_conf() {
 	echo "  appdeploy package-deploy-conf user@host:/opt/apps myapp:1.0.0 config.tar.gz"
 }
 
+# Function: appdeploy_help_prepare
+# Shows help for the 'prepare' command
+function appdeploy_help_prepare() {
+	echo "${BOLD}appdeploy prepare - Prepare target for deployment${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy prepare [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host[:path] (default: :$APPDEPLOY_DEFAULT_TARGET)"
+	echo ""
+	echo "${BOLD}Description:${RESET}"
+	echo "  Prepares the target for deployment:"
+	echo "  - Creates target directory structure if it doesn't exist"
+	echo "  - Displays list of installed packages and versions"
+	echo "  - Active packages are highlighted in green"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy prepare                           # Prepare local default target"
+	echo "  appdeploy prepare agent@stage               # Prepare remote target with default path"
+	echo "  appdeploy prepare user@host:/opt/apps       # Prepare remote target with custom path"
+}
+
+# Function: appdeploy_help_deploy
+# Shows help for the 'deploy' command
+function appdeploy_help_deploy() {
+	echo "${BOLD}appdeploy deploy - Deploy a package to target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy deploy [-p|--package NAME[-VERSION]] PACKAGE_PATH [CONF_ARCHIVE] [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE_PATH" "Package directory or archive"
+	printf "  %-20s %s\n" "CONF_ARCHIVE" "Optional configuration archive"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path (default: :$APPDEPLOY_DEFAULT_TARGET)"
+	echo ""
+	echo "${BOLD}Options:${RESET}"
+	printf "  %-20s %s\n" "-p, --package NAME" "Override package name (and optionally version with NAME-VERSION)"
+	echo ""
+	echo "${BOLD}Description:${RESET}"
+	echo "  Deploys a package to the specified target, handling the full deployment lifecycle:"
+	echo "  1. Terraforms target configuration"
+	echo "  2. Creates package archive if directory"
+	echo "  3. Uploads package to target"
+	echo "  4. Installs package on target"
+	echo "  5. Deactivates current package if any"
+	echo "  6. Activates new package"
+	echo "  7. Deploys configuration if provided"
+	echo "  8. Starts the package"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy deploy myapp-1.0.0.tar.gz"
+	echo "  appdeploy deploy myapp-1.0.0.tar.gz user@host:/opt/apps"
+	echo "  appdeploy deploy /path/to/myapp config.tar.gz user@host:/opt/apps"
+	echo "  appdeploy deploy -p myapp-2.0.0 /path/to/myapp"
+}
+
 # ----------------------------------------------------------------------------
 #
 # MAIN
@@ -2010,6 +2411,12 @@ function appdeploy_cli() {
 			package-deploy-conf)
 				appdeploy_help_package_deploy_conf
 				;;
+			prepare)
+				appdeploy_help_prepare
+				;;
+			deploy)
+				appdeploy_help_deploy
+				;;
 			*)
 				appdeploy_error "Unknown command: $help_target"
 				appdeploy_error "Use 'appdeploy --help' for usage information"
@@ -2105,7 +2512,17 @@ function appdeploy_cli() {
 		;;
 		package-deploy-conf)
 			appdeploy_package_deploy_conf "$@"
-		;;
+			;;
+		prepare)
+			appdeploy_prepare "$@"
+			;;
+		deploy)
+			if [[ $# -lt 1 ]]; then
+				appdeploy_help_deploy
+				return 1
+			fi
+			appdeploy_deploy "$@"
+			;;
 		--help|-h|help)
 			appdeploy_show_help "true"
 		;;

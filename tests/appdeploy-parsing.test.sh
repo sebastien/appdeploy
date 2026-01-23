@@ -54,7 +54,7 @@ test-expect "$result" "/opt/apps" "Extract path from host:path"
 
 test-step "appdeploy_target_path: no colon (no path)"
 result=$(appdeploy_target_path "server" || echo "")
-test-expect "$result" "" "Empty path when no colon"
+test-expect "$result" "/opt/apps" "Default path when no colon"
 
 test-step "appdeploy_target_path: local path only"
 result=$(appdeploy_target_path ":/opt/apps")
