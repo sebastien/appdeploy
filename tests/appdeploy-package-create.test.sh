@@ -69,24 +69,44 @@ test-step "Fail when destination has invalid name format"
 test-expect-failure appdeploy_package_create "$EXAMPLES_DIR" "$TEST_PATH/invalid.tar.gz"
 
 # -----------------------------------------------------------------------------
-# Warn when env.sh missing
+# Fail when env.sh missing
 # -----------------------------------------------------------------------------
-test-step "Warn when env.sh missing"
+test-step "Fail when env.sh missing"
 mkdir -p "$TEST_PATH/no-env"
 echo '#!/bin/bash' > "$TEST_PATH/no-env/run.sh"
-output=$(appdeploy_package_create "$TEST_PATH/no-env" "$TEST_PATH/no-env-1.0.0.tar.gz" 2>&1)
-test-substring "$output" "No 'env.sh' found"
-test-ok "Warning issued for missing env.sh"
+chmod +x "$TEST_PATH/no-env/run.sh"
+test-expect-failure appdeploy_package_create "$TEST_PATH/no-env" "$TEST_PATH/no-env-1.0.0.tar.gz"
 
 # -----------------------------------------------------------------------------
-# Warn when run.sh missing
+# Fail when run.sh missing
 # -----------------------------------------------------------------------------
-test-step "Warn when run.sh missing"
+test-step "Fail when run.sh missing"
 mkdir -p "$TEST_PATH/no-run"
 echo '#!/bin/bash' > "$TEST_PATH/no-run/env.sh"
-output=$(appdeploy_package_create "$TEST_PATH/no-run" "$TEST_PATH/no-run-1.0.0.tar.gz" 2>&1)
-test-substring "$output" "No 'run.sh' found"
-test-ok "Warning issued for missing run.sh"
+chmod +x "$TEST_PATH/no-run/env.sh"
+test-expect-failure appdeploy_package_create "$TEST_PATH/no-run" "$TEST_PATH/no-run-1.0.0.tar.gz"
+
+# -----------------------------------------------------------------------------
+# Fail when env.sh not executable
+# -----------------------------------------------------------------------------
+test-step "Fail when env.sh not executable"
+mkdir -p "$TEST_PATH/env-not-exec"
+echo '#!/bin/bash' > "$TEST_PATH/env-not-exec/env.sh"
+echo '#!/bin/bash' > "$TEST_PATH/env-not-exec/run.sh"
+chmod +x "$TEST_PATH/env-not-exec/run.sh"
+# env.sh is NOT executable (no chmod +x)
+test-expect-failure appdeploy_package_create "$TEST_PATH/env-not-exec" "$TEST_PATH/env-not-exec-1.0.0.tar.gz"
+
+# -----------------------------------------------------------------------------
+# Fail when run.sh not executable
+# -----------------------------------------------------------------------------
+test-step "Fail when run.sh not executable"
+mkdir -p "$TEST_PATH/run-not-exec"
+echo '#!/bin/bash' > "$TEST_PATH/run-not-exec/env.sh"
+echo '#!/bin/bash' > "$TEST_PATH/run-not-exec/run.sh"
+chmod +x "$TEST_PATH/run-not-exec/env.sh"
+# run.sh is NOT executable (no chmod +x)
+test-expect-failure appdeploy_package_create "$TEST_PATH/run-not-exec" "$TEST_PATH/run-not-exec-1.0.0.tar.gz"
 
 # -----------------------------------------------------------------------------
 # Create package in nested directory

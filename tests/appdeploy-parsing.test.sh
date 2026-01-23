@@ -120,6 +120,41 @@ test-step "appdeploy_package_parse: name with hyphen and version"
 result=$(appdeploy_package_parse "my-app:2.0.0-rc1")
 test-expect "$result" "my-app 2.0.0-rc1" "Parse hyphenated name with version"
 
+# -----------------------------------------------------------------------------
+# appdeploy_package_name and appdeploy_package_version: git hash versions
+# -----------------------------------------------------------------------------
+test-step "appdeploy_package_name: git hash version"
+result=$(appdeploy_package_name "littlenotes-c1b87d2.tar.gz")
+test-expect "$result" "littlenotes" "Extract name from git hash version"
+
+test-step "appdeploy_package_version: git hash version"
+result=$(appdeploy_package_version "littlenotes-c1b87d2.tar.gz")
+test-expect "$result" "c1b87d2" "Extract git hash version"
+
+test-step "appdeploy_package_name: timestamped git hash"
+result=$(appdeploy_package_name "myapp-20260124-abc1234.tar.gz")
+test-expect "$result" "myapp" "Extract name from timestamped git hash"
+
+test-step "appdeploy_package_version: timestamped git hash"
+result=$(appdeploy_package_version "myapp-20260124-abc1234.tar.gz")
+test-expect "$result" "20260124-abc1234" "Extract timestamped git hash version"
+
+test-step "appdeploy_package_name: v-prefixed version"
+result=$(appdeploy_package_name "myapp-v1.0.0.tar.gz")
+test-expect "$result" "myapp" "Extract name from v-prefixed version"
+
+test-step "appdeploy_package_version: v-prefixed version"
+result=$(appdeploy_package_version "myapp-v1.0.0.tar.gz")
+test-expect "$result" "v1.0.0" "Extract v-prefixed version"
+
+test-step "appdeploy_package_name: multi-dash name with git hash"
+result=$(appdeploy_package_name "my-cool-app-abc1234.tar.xz")
+test-expect "$result" "my-cool-app" "Extract multi-dash name with git hash"
+
+test-step "appdeploy_package_version: multi-dash name with git hash"
+result=$(appdeploy_package_version "my-cool-app-abc1234.tar.xz")
+test-expect "$result" "abc1234" "Extract git hash from multi-dash name"
+
 test-end
 
 # EOF

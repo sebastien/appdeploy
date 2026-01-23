@@ -114,6 +114,72 @@ test-step "appdeploy_version_latest: complex versions"
 result=$(appdeploy_version_latest "1.0.0" "1.0.1" "1.1.0" "2.0.0-rc1")
 test-expect "$result" "2.0.0-rc1" "Latest with complex versions"
 
+# -----------------------------------------------------------------------------
+# appdeploy_validate_version
+# -----------------------------------------------------------------------------
+test-step "appdeploy_validate_version: semver"
+appdeploy_validate_version "1.0.0" 2>/dev/null
+result=$?
+test-expect "$result" "0" "1.0.0 is valid"
+
+test-step "appdeploy_validate_version: v-prefixed"
+appdeploy_validate_version "v1.0.0" 2>/dev/null
+result=$?
+test-expect "$result" "0" "v1.0.0 is valid"
+
+test-step "appdeploy_validate_version: git hash"
+appdeploy_validate_version "c1b87d2" 2>/dev/null
+result=$?
+test-expect "$result" "0" "c1b87d2 (git hash) is valid"
+
+test-step "appdeploy_validate_version: long git hash"
+appdeploy_validate_version "abc123def456" 2>/dev/null
+result=$?
+test-expect "$result" "0" "abc123def456 (long git hash) is valid"
+
+test-step "appdeploy_validate_version: timestamped git hash"
+appdeploy_validate_version "20260124-c1b87d2" 2>/dev/null
+result=$?
+test-expect "$result" "0" "20260124-c1b87d2 (timestamped) is valid"
+
+test-step "appdeploy_validate_version: version with rc suffix"
+appdeploy_validate_version "1.0.0-rc1" 2>/dev/null
+result=$?
+test-expect "$result" "0" "1.0.0-rc1 is valid"
+
+test-step "appdeploy_validate_version: version with underscore"
+appdeploy_validate_version "1.0.0_build123" 2>/dev/null
+result=$?
+test-expect "$result" "0" "1.0.0_build123 is valid"
+
+test-step "appdeploy_validate_version: empty is invalid"
+set +e
+appdeploy_validate_version "" 2>/dev/null
+result=$?
+set -e
+test-expect "$result" "1" "Empty version is invalid"
+
+test-step "appdeploy_validate_version: path traversal invalid"
+set +e
+appdeploy_validate_version "1.0..0" 2>/dev/null
+result=$?
+set -e
+test-expect "$result" "1" "Version with .. is invalid"
+
+test-step "appdeploy_validate_version: special chars invalid"
+set +e
+appdeploy_validate_version "1.0.0/bad" 2>/dev/null
+result=$?
+set -e
+test-expect "$result" "1" "Version with / is invalid"
+
+test-step "appdeploy_validate_version: starts with dash invalid"
+set +e
+appdeploy_validate_version "-1.0.0" 2>/dev/null
+result=$?
+set -e
+test-expect "$result" "1" "Version starting with - is invalid"
+
 test-end
 
 # EOF

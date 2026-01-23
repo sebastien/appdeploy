@@ -30,6 +30,26 @@ APPDEPLOY_VERSION="0.1.0"
 APPDEPLOY_TARGET=${APPDEPLOY_TARGET:-/opt/apps}
 
 # ============================================================================
+# ERROR HANDLING
+# ============================================================================
+
+# Global error handler for CLI - ensures errors are logged before exit
+# This catches unexpected failures from 'set -e' and provides context
+function appdeploy_trap_error() {
+	local exit_code=$?
+	local line_no=$1
+	# Only log if we have a real error (not normal exit)
+	if [[ $exit_code -ne 0 ]]; then
+		echo "~!~ Command failed (exit code $exit_code) at line $line_no" >&2
+	fi
+}
+
+# Set trap when running as CLI (not when sourced as library)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	trap 'appdeploy_trap_error $LINENO' ERR
+fi
+
+# ============================================================================
 # SECURITY HELPERS
 # ============================================================================
 
@@ -60,16 +80,20 @@ function appdeploy_validate_name() {
 }
 
 # Function: appdeploy_validate_version VERSION
-# Validates that VERSION is a valid semver-like version string
+# Validates that VERSION is a valid version string.
+# Accepts: semver (1.0.0), prefixed (v1.0.0), git hashes (c1b87d2), 
+#          timestamped (20260124-c1b87d2), etc.
+# Must start with alphanumeric and contain only alphanumeric, dot, dash, underscore.
+# For git hashes, recommend prefixing with timestamp for sortability: 20260124-c1b87d2
 # Returns 0 if valid, 1 if invalid
 function appdeploy_validate_version() {
 	local version="$1"
 	if [[ -z "$version" ]]; then
 		return 1
 	fi
-	# Only allow semver-like versions: digits, dots, dashes, alphanumeric suffixes
-	if [[ ! "$version" =~ ^[0-9][0-9a-zA-Z._-]*$ ]]; then
-		appdeploy_error "Invalid version: '$version' (must start with digit, contain only alphanumeric, dot, dash, underscore)"
+	# Allow versions starting with digit or letter (for git hashes, v-prefixes, etc.)
+	if [[ ! "$version" =~ ^[0-9a-zA-Z][0-9a-zA-Z._-]*$ ]]; then
+		appdeploy_error "Invalid version: '$version' (must start with alphanumeric, contain only alphanumeric, dot, dash, underscore)"
 		return 1
 	fi
 	# Prevent path traversal
@@ -166,11 +190,21 @@ function appdeploy_target_path() {
 }
 
 function appdeploy_package_name() {
-	[[ $1 =~ ^(.*)-[0-9].*\.tar\.(gz|bz2|xz)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	# Try digit-starting version first (most common: semver, timestamps), then letter-starting (git hashes, v-prefix)
+	if [[ $1 =~ ^(.*)-([0-9][0-9a-zA-Z._-]*)\.tar\.(gz|bz2|xz)$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	elif [[ $1 =~ ^(.*)-([a-zA-Z][0-9a-zA-Z._-]*)\.tar\.(gz|bz2|xz)$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	fi
 }
 
 function appdeploy_package_version() { # $1 = filename
-	[[ $1 =~ ^.*-([0-9][0-9.a-zA-Z-]*)\.tar\.(gz|bz2|xz)$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	# Try digit-starting version first (most common: semver, timestamps), then letter-starting (git hashes, v-prefix)
+	if [[ $1 =~ ^.*-([0-9][0-9a-zA-Z._-]*)\.tar\.(gz|bz2|xz)$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	elif [[ $1 =~ ^.*-([a-zA-Z][0-9a-zA-Z._-]*)\.tar\.(gz|bz2|xz)$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	fi
 }
 
 function appdeploy_package_ext() { # $1 = filename
@@ -336,8 +370,12 @@ function appdeploy_file_exists () {
 function appdeploy_package_upload() {
 	local target="$1"
 	local package="$2"
-	local name="${3:-$(appdeploy_package_name "$(basename "$package")")}"
-	local version="${4:-$(appdeploy_package_version "$(basename "$package")")}"
+	# Parse name/version with || true to prevent set -e from exiting before error messages
+	local parsed_name parsed_version
+	parsed_name=$(appdeploy_package_name "$(basename "$package")") || true
+	parsed_version=$(appdeploy_package_version "$(basename "$package")") || true
+	local name="${3:-$parsed_name}"
+	local version="${4:-$parsed_version}"
 	local ext=$(appdeploy_package_ext "$(basename "$package")")
 	
 	# Validate inputs
@@ -1011,12 +1049,28 @@ function appdeploy_package_create () {
 		return 1
 	fi
 	
-	[[ ! -e "$source/env.sh" ]] && appdeploy_warn "No 'env.sh' found in source: $source"
-	[[ ! -e "$source/run.sh" ]] && appdeploy_warn "No 'run.sh' found in source: $source"
+	# Check env.sh exists and is executable
+	if [[ ! -e "$source/env.sh" ]]; then
+		appdeploy_error "No 'env.sh' found in source: $source"
+		return 1
+	elif [[ ! -x "$source/env.sh" ]]; then
+		appdeploy_error "'env.sh' is not executable in source: $source"
+		return 1
+	fi
+	# Check run.sh exists and is executable
+	if [[ ! -e "$source/run.sh" ]]; then
+		appdeploy_error "No 'run.sh' found in source: $source"
+		return 1
+	elif [[ ! -x "$source/run.sh" ]]; then
+		appdeploy_error "'run.sh' is not executable in source: $source"
+		return 1
+	fi
 	
 	# Validate destination filename format
-	local name=$(appdeploy_package_name "$(basename "$destination")")
-	local version=$(appdeploy_package_version "$(basename "$destination")")
+	# Use || true to prevent set -e from exiting before we can show error messages
+	local name version
+	name=$(appdeploy_package_name "$(basename "$destination")") || true
+	version=$(appdeploy_package_version "$(basename "$destination")") || true
 	
 	if [[ -z "$name" ]]; then
 		appdeploy_error "Invalid destination filename format: $destination (expected NAME-VERSION.tar.[gz|bz2|xz])"
@@ -1058,6 +1112,169 @@ function appdeploy_package_create () {
 	fi
 	
 	appdeploy_log "Successfully created package: $destination"
+}
+
+# Function: appdeploy_package_run TARGET PACKAGE_ARCHIVE [CONF_ARCHIVE] [DRY_RUN] [OVERLAY_PATHS...]
+# Runs a package in the specified TARGET directory, creating a temporary deployment
+# and executing the application. Cleans up the target directory after execution.
+#
+# Arguments:
+#   TARGET           Target directory in format [:PATH] for local execution
+#   PACKAGE_ARCHIVE  Path to the package archive file
+#   CONF_ARCHIVE     Optional configuration archive to deploy
+#   DRY_RUN          If "true", set up without executing (optional, defaults to false)
+#   OVERLAY_PATHS    Optional space-separated list of overlay paths to symlink
+#
+# Returns: Exit status of the executed application
+function appdeploy_package_run() {
+	local target="$1"
+	local package_archive="$2"
+	local conf_archive="${3:-}"
+	local dry_run="${4:-false}"
+	local overlay_paths=("${@:5}")
+	local start_time end_time runtime exit_status
+	
+	# Validate package archive
+	if [[ ! -f "$package_archive" ]]; then
+		appdeploy_error "Package archive does not exist: $package_archive"
+		return 1
+	fi
+	
+	# Extract package name and version from archive filename
+	# Use || true to prevent set -e from exiting before we can show error messages
+	local name version
+	name=$(appdeploy_package_name "$(basename "$package_archive")") || true
+	version=$(appdeploy_package_version "$(basename "$package_archive")") || true
+	
+	if [[ -z "$name" ]]; then
+		appdeploy_error "Could not determine package name from: $package_archive"
+		return 1
+	fi
+	
+	if [[ -z "$version" ]]; then
+		appdeploy_error "Could not determine package version from: $package_archive"
+		return 1
+	fi
+	
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	if ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
+	appdeploy_log "Running package $name:$version in $target"
+	
+	# Install target structure
+	if ! appdeploy_target_install "$target"; then
+		appdeploy_error "Failed to install target structure"
+		return 1
+	fi
+	
+	# Upload package to target
+	if ! appdeploy_package_upload "$target" "$package_archive" "$name" "$version"; then
+		appdeploy_error "Failed to upload package"
+		return 1
+	fi
+	
+	# Install package
+	if ! appdeploy_package_install "$target" "$name:$version"; then
+		appdeploy_error "Failed to install package"
+		return 1
+	fi
+	
+	# Deploy configuration if provided
+	if [[ -n "$conf_archive" ]]; then
+		if ! appdeploy_package_deploy_conf "$target" "$name:$version" "$conf_archive"; then
+			appdeploy_error "Failed to deploy configuration"
+			return 1
+		fi
+	fi
+	
+	# Activate package
+	if ! appdeploy_package_activate "$target" "$name:$version"; then
+		appdeploy_error "Failed to activate package"
+		return 1
+	fi
+	
+	# Create overlay symlinks if provided
+	if [[ ${#overlay_paths[@]} -gt 0 ]]; then
+		local path=$(appdeploy_target_path "$target")
+		local run_dir="$path/$name/run"
+		local escaped_run_dir
+		escaped_run_dir=$(appdeploy_escape_single_quotes "$run_dir")
+		
+		for overlay_path in "${overlay_paths[@]}"; do
+			if [[ -e "$overlay_path" ]]; then
+				local overlay_name=$(basename "$overlay_path")
+				local escaped_overlay_name
+				escaped_overlay_name=$(appdeploy_escape_single_quotes "$overlay_name")
+				local escaped_overlay_path
+				escaped_overlay_path=$(appdeploy_escape_single_quotes "$overlay_path")
+				
+				# Create symlink from overlay to run directory
+				if ! appdeploy_cmd_run "$target" "ln -sf '${escaped_overlay_path}' '${escaped_run_dir}/${escaped_overlay_name}'"; then
+					appdeploy_warn "Failed to create symlink for overlay: $overlay_path"
+				fi
+			else
+				appdeploy_warn "Overlay path does not exist: $overlay_path"
+			fi
+		done
+	fi
+	
+	local path=$(appdeploy_target_path "$target")
+	local run_dir="$path/$name/run"
+	local env_file="$run_dir/env.sh"
+	local run_file="$run_dir/run.sh"
+	
+	# Check required files exist and are executable
+	if [[ ! -f "$env_file" ]]; then
+		appdeploy_error "Required file env.sh not found in package"
+		return 1
+	fi
+	if [[ ! -x "$env_file" ]]; then
+		appdeploy_error "Required file env.sh is not executable"
+		return 1
+	fi
+	
+	if [[ ! -f "$run_file" ]]; then
+		appdeploy_error "Required file run.sh not found in package"
+		return 1
+	fi
+	if [[ ! -x "$run_file" ]]; then
+		appdeploy_error "Required file run.sh is not executable"
+		return 1
+	fi
+	
+	# Handle dry run - skip execution
+	if [[ "$dry_run" == "true" ]]; then
+		appdeploy_log "Dry run mode - package $name:$version set up at $run_dir"
+		appdeploy_log "Skipping execution of env.sh and run.sh"
+		return 0
+	fi
+	
+	# Execute the application
+	appdeploy_log "Starting application $name:$version"
+	start_time=$(date +%s)
+	
+	# Execute with proper environment
+	# Use bash -c to source env.sh and then execute run.sh in the same shell
+	if ! bash -c "source '${env_file}' && '${run_file}'"; then
+		exit_status=$?
+		appdeploy_error "Application exited with status $exit_status"
+	else
+		exit_status=0
+		appdeploy_log "Application completed successfully"
+	fi
+	
+	end_time=$(date +%s)
+	runtime=$((end_time - start_time))
+	
+	appdeploy_log "Runtime: ${runtime}s"
+	appdeploy_log "Exit status: ${exit_status}"
+	
+	return $exit_status
 }
 
 # ----------------------------------------------------------------------------
@@ -1114,6 +1331,101 @@ function appdeploy_target_check() {
 	return 0
 }
 
+# Function: appdeploy_run PACKAGE_ARCHIVE [-c CONF_ARCHIVE] [-r RUN_PATH] [-d|--dry] [OVERLAY_PATHS...]
+# CLI wrapper for running packages. Creates temporary target and calls appdeploy_package_run().
+#
+# Arguments:
+#   PACKAGE_ARCHIVE  Path to the package archive file
+#   -c CONF_ARCHIVE  Optional configuration archive
+#   -r RUN_PATH      Optional run path (defaults to temporary directory)
+#   -d, --dry        Dry run mode - set up without executing env.sh or run.sh
+#   OVERLAY_PATHS    Optional overlay paths to symlink
+#
+# Returns: Exit status of the executed application
+function appdeploy_run() {
+	local package_archive=""
+	local conf_archive=""
+	local run_path=""
+	local dry_run="false"
+	local overlay_paths=()
+	
+	# Parse arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-c|--config)
+				if [[ $# -lt 2 ]]; then
+					appdeploy_error "Missing argument for -c/--config"
+					return 1
+				fi
+				conf_archive="$2"
+				shift 2
+			;;
+			-r|--run)
+				if [[ $# -lt 2 ]]; then
+					appdeploy_error "Missing argument for -r/--run"
+					return 1
+				fi
+				run_path="$2"
+				shift 2
+			;;
+			-d|--dry)
+				dry_run="true"
+				shift
+			;;
+			-*)
+				appdeploy_error "Unknown option: $1"
+				return 1
+			;;
+			*)
+				if [[ -z "$package_archive" ]]; then
+					package_archive="$1"
+				else
+					overlay_paths+=("$1")
+				fi
+				shift
+			;;
+		esac
+	done
+	
+	# Validate required argument
+	if [[ -z "$package_archive" ]]; then
+		appdeploy_error "Missing required argument: PACKAGE_ARCHIVE"
+		return 1
+	fi
+	
+	# Create temporary run directory if not provided
+	if [[ -z "$run_path" ]]; then
+		# Create temporary directory in current working directory
+		# Use absolute path to ensure proper validation
+		run_path=$(mktemp -d "$(pwd)/appdeploy.run.XXXX") || {
+			appdeploy_error "Failed to create temporary run directory"
+			return 1
+		}
+		appdeploy_log "Created temporary run directory: $run_path"
+		# Set cleanup trap for temporary directory
+		# Use a simple approach that doesn't rely on function scope
+		APPDEPLOY_RUN_TEMP_DIR="$run_path"
+		trap '[[ -n "$APPDEPLOY_RUN_TEMP_DIR" && -d "$APPDEPLOY_RUN_TEMP_DIR" ]] && { appdeploy_log "Cleaning up temporary run directory: $APPDEPLOY_RUN_TEMP_DIR"; find "$APPDEPLOY_RUN_TEMP_DIR" -type l -delete 2>/dev/null || true; rm -rf "$APPDEPLOY_RUN_TEMP_DIR" 2>/dev/null || true; }' EXIT INT TERM
+	else
+		# For user-provided run path, just ensure it exists
+		if [[ ! -d "$run_path" ]]; then
+			mkdir -p "$run_path" || {
+				appdeploy_error "Failed to create run directory: $run_path"
+				return 1
+			}
+		fi
+	fi
+	
+	# Set up target in appdeploy format
+	local target=":$run_path"
+	
+	# Call the core package run function
+	appdeploy_package_run "$target" "$package_archive" "$conf_archive" "$dry_run" "${overlay_paths[@]}"
+	
+	# Return exit status from package execution
+	return $?
+}
+
 # ----------------------------------------------------------------------------
 #
 # MAIN
@@ -1121,7 +1433,121 @@ function appdeploy_target_check() {
 # ----------------------------------------------------------------------------
 
 function appdeploy_cli() {
-	appdeploy_target_check ":$APPDEPLOY_TARGET"
+	# Check if we have any arguments
+	if [[ $# -eq 0 ]]; then
+		# No arguments - show help or check default target
+		appdeploy_target_check ":$APPDEPLOY_TARGET"
+		return 0
+	fi
+	
+	# Parse subcommand
+	local subcommand="$1"
+	shift
+	
+	case "$subcommand" in
+		run)
+			appdeploy_run "$@"
+		;;
+		package)
+			# Handle package subcommands
+			if [[ $# -eq 0 ]]; then
+				appdeploy_error "Missing package subcommand"
+				return 1
+			fi
+			local package_subcommand="$1"
+			shift
+			case "$package_subcommand" in
+				create)
+					# appdeploy package create SOURCE DESTINATION
+					if [[ $# -lt 2 ]]; then
+						appdeploy_error "Usage: appdeploy package create SOURCE DESTINATION"
+						return 1
+					fi
+					appdeploy_package_create "$1" "$2"
+				;;
+				*)
+					appdeploy_error "Unknown package subcommand: $package_subcommand"
+					return 1
+				;;
+			esac
+		;;
+		target)
+			# Handle target subcommands
+			if [[ $# -eq 0 ]]; then
+				appdeploy_error "Missing target subcommand"
+				return 1
+			fi
+			local target_subcommand="$1"
+			shift
+			case "$target_subcommand" in
+				install)
+					if [[ $# -lt 1 ]]; then
+						appdeploy_error "Usage: appdeploy target install TARGET"
+						return 1
+					fi
+					appdeploy_target_install "$1"
+				;;
+				check)
+					if [[ $# -lt 1 ]]; then
+						appdeploy_error "Usage: appdeploy target check TARGET"
+						return 1
+					fi
+					appdeploy_target_check "$1"
+				;;
+				*)
+					appdeploy_error "Unknown target subcommand: $target_subcommand"
+					return 1
+				;;
+			esac
+		;;
+		package-upload)
+			appdeploy_package_upload "$@"
+		;;
+		package-install)
+			appdeploy_package_install "$@"
+		;;
+		package-activate)
+			appdeploy_package_activate "$@"
+		;;
+		package-deactivate)
+			appdeploy_package_deactivate "$@"
+		;;
+		package-uninstall)
+			appdeploy_package_uninstall "$@"
+		;;
+		package-remove)
+			appdeploy_package_remove "$@"
+		;;
+		package-list)
+			appdeploy_package_list "$@"
+		;;
+		package-deploy-conf)
+			appdeploy_package_deploy_conf "$@"
+		;;
+		--help|-h|help)
+			echo "Usage: appdeploy [--version] [--help]"
+			echo "       appdeploy run PACKAGE_ARCHIVE [-c CONF_ARCHIVE] [-r RUN_PATH] [OVERLAY_PATHS...]"
+			echo "       appdeploy package create SOURCE DESTINATION"
+			echo "       appdeploy target install TARGET"
+			echo "       appdeploy target check TARGET"
+			echo "       appdeploy package-upload TARGET PACKAGE [NAME] [VERSION]"
+			echo "       appdeploy package-install TARGET PACKAGE[:VERSION]"
+			echo "       appdeploy package-activate TARGET PACKAGE[:VERSION]"
+			echo "       appdeploy package-deactivate TARGET PACKAGE[:VERSION]"
+			echo "       appdeploy package-uninstall TARGET PACKAGE[:VERSION]"
+			echo "       appdeploy package-remove TARGET PACKAGE[:VERSION]"
+			echo "       appdeploy package-list TARGET [PACKAGE][:VERSION]"
+			echo "       appdeploy package-deploy-conf TARGET PACKAGE[:VERSION] CONF_ARCHIVE"
+		;;
+		--version|-v)
+			echo "appdeploy version $APPDEPLOY_VERSION"
+		;;
+		*)
+			appdeploy_error "Unknown command: $subcommand"
+			appdeploy_error "Use 'appdeploy --help' for usage information"
+			return 1
+		;;
+	esac
 }
 
 # Only run CLI if script is executed directly (not sourced)
