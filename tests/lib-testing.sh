@@ -222,14 +222,17 @@ function test-end {
 # Peforms a cleanup
 function test_cleanup {
 	if [ -e "$TEST_PATH" ]; then
+		chmod -R u+w "$TEST_PATH" 2>/dev/null || true
 		rm -rf "$TEST_PATH"
 	fi
 	for path in "${TEST_CLEAN[@]}"; do
 		if [ -z "$path" ]; then
 			continue
 		elif [ -d "$path" ]; then
+			chmod -R u+w "$path" 2>/dev/null || true
 			rm -rf "$path"
 		elif [ -e "$path" ]; then
+			chmod u+w "$path" 2>/dev/null || true
 			unlink "$path"
 		fi
 	done

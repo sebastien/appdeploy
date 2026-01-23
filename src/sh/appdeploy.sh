@@ -29,6 +29,28 @@ set -euo pipefail
 APPDEPLOY_VERSION="0.1.0"
 APPDEPLOY_TARGET=${APPDEPLOY_TARGET:-/opt/apps}
 
+# --
+# ## Color library
+# Add colored output support similar to lib-testing.sh
+if [ -z "${NOCOLOR:-}" ] && [ -n "${TERM:-}" ] && tput setaf 1 &>/dev/null; then
+	BLUE="$(tput setaf 33)"
+	GREEN="$(tput setaf 34)"
+	YELLOW="$(tput setaf 220)"
+	RED="$(tput setaf 124)"
+	GRAY="$(tput setaf 153)"
+	BOLD="$(tput bold)"
+	RESET="$(tput sgr0)"
+else
+	BLUE=""
+	GREEN=""
+	YELLOW=""
+	RED=""
+	GRAY=""
+	BOLD=""
+	RESET=""
+fi
+export BLUE GREEN YELLOW RED GRAY BOLD RESET
+
 # ============================================================================
 # ERROR HANDLING
 # ============================================================================
@@ -159,19 +181,41 @@ function appdeploy_make_temp_file() {
 # LOGGING
 # ============================================================================
 
+# Function: appdeploy_format_path PATH
+# Formats a path with bold styling for better visibility
+function appdeploy_format_path() {
+	printf '%s%s%s' "$BOLD" "$1" "$RESET"
+}
+
 function appdeploy_log() {
 	local prefix="_._"
-	printf '%s %s\n' "$prefix" "$*"
+	printf '%s%s %s%s\n' "$BLUE" "$prefix" "$*" "$RESET"
 }
 
 function appdeploy_warn() {
 	local prefix="-!-"
-	printf '%s %s\n' "$prefix" "$*"
+	printf '%s%s %s%s\n' "$YELLOW" "$prefix" "$*" "$RESET"
 }
 
 function appdeploy_error() {
 	local prefix="~!~"
-	printf '%s %s\n' "$prefix" "$*"
+	printf '%s%s %s%s\n' "$RED" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_info MESSAGE
+# Outputs an informational message in green
+function appdeploy_info() {
+	local prefix="_i_"
+	printf '%s%s %s%s\n' "$GREEN" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_debug MESSAGE
+# Outputs a debug message in gray (only shown when DEBUG=1)
+function appdeploy_debug() {
+	if [ -n "${DEBUG:-}" ]; then
+		local prefix="_d_"
+		printf '%s%s %s%s\n' "$GRAY" "$prefix" "$*" "$RESET"
+	fi
 }
 
 # ============================================================================
@@ -439,7 +483,7 @@ function appdeploy_package_upload() {
 	local dest_dir="$path/$name/packages"
 	local dest_file="$name-$version.tar.$ext"
 	
-	appdeploy_log "Uploading $package to $target as $dest_file"
+	appdeploy_log "Uploading $(appdeploy_format_path "$package") to $(appdeploy_format_path "$target") as $(appdeploy_format_path "$dest_file")"
 	
 	# Ensure destination directory exists
 	local escaped_dest_dir
@@ -460,7 +504,7 @@ function appdeploy_package_upload() {
 		fi
 	fi
 	
-	appdeploy_log "Successfully uploaded $dest_file"
+	appdeploy_log "Successfully uploaded $(appdeploy_format_path "$dest_file")"
 }
 
 # Function: appdeploy_package_install TARGET PACKAGE[:VERSION]
@@ -511,12 +555,12 @@ function appdeploy_package_install() {
 		if ! appdeploy_validate_version "$version"; then
 			return 1
 		fi
-		appdeploy_log "Resolved latest version: $version"
+		appdeploy_log "Resolved latest version: $(appdeploy_format_path "$version")"
 	fi
-	
+
 	local escaped_version
 	escaped_version=$(appdeploy_escape_single_quotes "$version")
-	
+
 	# Find the package file
 	local pkg_file
 	pkg_file=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}/${escaped_name}-${escaped_version}'.tar.* 2>/dev/null | head -1")
@@ -540,7 +584,7 @@ function appdeploy_package_install() {
 		return 0
 	fi
 	
-	appdeploy_log "Installing $name:$version"
+	appdeploy_log "Installing $(appdeploy_format_path "$name:$version")"
 	
 	# Escape pkg_file for the command
 	local escaped_pkg_file
@@ -554,7 +598,7 @@ function appdeploy_package_install() {
 		return 1
 	fi
 	
-	appdeploy_log "Successfully installed $name:$version to $dist_dir/$version"
+	appdeploy_log "Successfully installed $(appdeploy_format_path "$name:$version") to $(appdeploy_format_path "$dist_dir/$version")"
 }
 
 # Function: appdeploy_package_activate TARGET PACKAGE[:VERSION]
@@ -615,12 +659,12 @@ function appdeploy_package_activate() {
 		if ! appdeploy_validate_version "$version"; then
 			return 1
 		fi
-		appdeploy_log "Resolved latest version: $version"
+		appdeploy_log "Resolved latest version: $(appdeploy_format_path "$version")"
 	fi
-	
+
 	local escaped_version
 	escaped_version=$(appdeploy_escape_single_quotes "$version")
-	
+
 	# Ensure package is installed
 	if ! appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
 		appdeploy_log "Package not installed, installing first..."
@@ -631,7 +675,7 @@ function appdeploy_package_activate() {
 		fi
 	fi
 	
-	appdeploy_log "Activating $name:$version"
+	appdeploy_log "Activating $(appdeploy_format_path "$name:$version")"
 	
 	# Create run and var directories
 	appdeploy_cmd_run "$target" "mkdir -p '${escaped_run_dir}' '${escaped_var_dir}'"
@@ -648,7 +692,7 @@ function appdeploy_package_activate() {
 	# Store active version marker
 	appdeploy_cmd_run "$target" "echo '${escaped_version}' > '${escaped_path}/${escaped_name}/.active'"
 	
-	appdeploy_log "Successfully activated $name:$version"
+	appdeploy_log "Successfully activated $(appdeploy_format_path "$name:$version")"
 }
 
 # Function: appdeploy_package_deactivate TARGET PACKAGE[:VERSION]
@@ -777,7 +821,8 @@ function appdeploy_package_uninstall() {
 	appdeploy_log "Uninstalling $name:$version"
 	
 	# Remove the dist directory for this version
-	appdeploy_cmd_run "$target" "rm -rf '${escaped_dist_dir}/${escaped_version}'"
+	# Files are read-only (555/444), so we need to restore write permissions first
+	appdeploy_cmd_run "$target" "chmod -R u+w '${escaped_dist_dir}/${escaped_version}' && rm -rf '${escaped_dist_dir}/${escaped_version}'"
 	
 	appdeploy_log "Successfully uninstalled $name:$version (archive kept)"
 }
@@ -1143,7 +1188,7 @@ function appdeploy_package_create () {
 		mkdir -p "$dest_dir"
 	fi
 	
-	appdeploy_log "Creating package $name-$version from $source"
+	appdeploy_log "Creating package $(appdeploy_format_path "$name-$version") from $(appdeploy_format_path "$source")"
 	
 	# Create staging directory for readonly copy
 	local staging
@@ -1185,7 +1230,7 @@ function appdeploy_package_create () {
 	chmod -R u+w "$staging" 2>/dev/null || true
 	rm -rf "$staging"
 	
-	appdeploy_log "Successfully created package: $destination"
+	appdeploy_log "Successfully created package: $(appdeploy_format_path "$destination")"
 }
 
 # Function: appdeploy_package PATH [VERSION|OUTPUT] [-f|--force]
@@ -1271,7 +1316,7 @@ function appdeploy_package() {
 	# Infer version if not set
 	if [[ -z "$version" && -z "$output" ]]; then
 		version=$(appdeploy_version_infer "$path")
-		appdeploy_log "Inferred version: $version"
+		appdeploy_log "Inferred version: $(appdeploy_format_path "$version")"
 	fi
 	
 	# Build output path if not set (default: current directory, .tar.gz)
@@ -1333,7 +1378,7 @@ function appdeploy_package_run() {
 		return 1
 	fi
 	
-	appdeploy_log "Running package $name:$version in $target"
+	appdeploy_log "Running package $(appdeploy_format_path "$name:$version") in $(appdeploy_format_path "$target")"
 	
 	# Install target structure
 	if ! appdeploy_target_install "$target"; then
@@ -1418,13 +1463,13 @@ function appdeploy_package_run() {
 	
 	# Handle dry run - skip execution
 	if [[ "$dry_run" == "true" ]]; then
-		appdeploy_log "Dry run mode - package $name:$version set up at $run_dir"
+		appdeploy_log "Dry run mode - package $(appdeploy_format_path "$name:$version") set up at $(appdeploy_format_path "$run_dir")"
 		appdeploy_log "Skipping execution of env.sh and run.sh"
 		return 0
 	fi
 	
 	# Execute the application
-	appdeploy_log "Starting application $name:$version"
+	appdeploy_log "Starting application $(appdeploy_format_path "$name:$version")"
 	start_time=$(date +%s)
 	
 	# Execute with proper environment
@@ -1464,7 +1509,7 @@ function appdeploy_target_install() {
 		return 1
 	fi
 	
-	appdeploy_log "Installing appdeploy directory structure on $target"
+	appdeploy_log "Installing appdeploy directory structure on $(appdeploy_format_path "$target")"
 	
 	local escaped_path
 	escaped_path=$(appdeploy_escape_single_quotes "$path")
@@ -1472,7 +1517,7 @@ function appdeploy_target_install() {
 	# Create base directory
 	appdeploy_cmd_run "$target" "mkdir -p '${escaped_path}'"
 	
-	appdeploy_log "Successfully installed appdeploy on $target at $path"
+	appdeploy_log "Successfully installed appdeploy on $(appdeploy_format_path "$target") at $(appdeploy_format_path "$path")"
 }
 
 # Function: appdeploy_target_check TARGET
