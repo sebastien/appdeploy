@@ -1642,22 +1642,383 @@ function appdeploy_run() {
 
 # ----------------------------------------------------------------------------
 #
+# HELP SYSTEM
+#
+# ----------------------------------------------------------------------------
+
+# Function: appdeploy_show_help
+# Displays comprehensive help for the CLI
+function appdeploy_show_help() {
+	local show_all="${1:-false}"
+	
+	echo "${BOLD}AppDeploy - Application Deployment Manager${RESET}"
+	echo "Version: $APPDEPLOY_VERSION"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy [GLOBAL_OPTIONS] COMMAND [ARGS...]"
+	echo ""
+	echo "${BOLD}Global Options:${RESET}"
+	printf "  %-20s %s\n" "--help, -h" "Show this help message"
+	printf "  %-20s %s\n" "--version, -v" "Show version information"
+	printf "  %-20s %s\n" "--debug" "Enable debug output"
+	echo ""
+	echo "${BOLD}Commands:${RESET}"
+	printf "  %-20s %s\n" "run" "Run a package archive"
+	printf "  %-20s %s\n" "package" "Create or manage packages"
+	printf "  %-20s %s\n" "target" "Manage deployment targets"
+	printf "  %-20s %s\n" "package-upload" "Upload package to target"
+	printf "  %-20s %s\n" "package-install" "Install package on target"
+	printf "  %-20s %s\n" "package-activate" "Activate package on target"
+	printf "  %-20s %s\n" "package-deactivate" "Deactivate package on target"
+	printf "  %-20s %s\n" "package-uninstall" "Uninstall package from target"
+	printf "  %-20s %s\n" "package-remove" "Remove package from target"
+	printf "  %-20s %s\n" "package-list" "List packages on target"
+	printf "  %-20s %s\n" "package-deploy-conf" "Deploy configuration to package"
+	echo ""
+	echo "${BOLD}Use 'appdeploy COMMAND --help' for more information on a specific command.${RESET}"
+	
+	if [[ "$show_all" == "true" ]]; then
+		echo ""
+		echo "${BOLD}Examples:${RESET}"
+		echo "  appdeploy run myapp-1.0.0.tar.gz"
+		echo "  appdeploy package /path/to/app v1.0.0"
+		echo "  appdeploy target install user@host:/opt/apps"
+		echo "  appdeploy package-upload user@host:/opt/apps myapp-1.0.0.tar.gz"
+		echo "  appdeploy package-list user@host:/opt/apps"
+		echo "  appdeploy package-activate user@host:/opt/apps myapp:1.0.0"
+	fi
+}
+
+# Function: appdeploy_help_run
+# Shows help for the 'run' command
+function appdeploy_help_run() {
+	echo "${BOLD}appdeploy run - Run a package archive${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy run PACKAGE_ARCHIVE [OPTIONS] [OVERLAY_PATHS...]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE_ARCHIVE" "Path to the package archive file"
+	echo "  OVERLAY_PATHS     Optional overlay paths to symlink"
+	echo ""
+	echo "${BOLD}Options:${RESET}"
+	printf "  %-20s %s\n" "-c, --config" "Configuration archive to deploy"
+	printf "  %-20s %s\n" "-r, --run" "Run path (defaults to temporary directory)"
+	printf "  %-20s %s\n" "-d, --dry" "Dry run mode (setup without execution)"
+	printf "  %-20s %s\n" "--help" "Show this help message"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy run myapp-1.0.0.tar.gz"
+	echo "  appdeploy run myapp-1.0.0.tar.gz -c config.tar.gz"
+	echo "  appdeploy run myapp-1.0.0.tar.gz -r /tmp/myapp --dry"
+}
+
+# Function: appdeploy_help_package
+# Shows help for the 'package' command
+function appdeploy_help_package() {
+	echo "${BOLD}appdeploy package - Create or manage packages${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package PATH [VERSION|OUTPUT] [OPTIONS]"
+	echo "  appdeploy package create SOURCE DESTINATION"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PATH" "Source directory to package"
+	printf "  %-20s %s\n" "VERSION" "Version string (e.g., 1.0.0)"
+	printf "  %-20s %s\n" "OUTPUT" "Output path (e.g., myapp-1.0.0.tar.gz)"
+	echo ""
+	echo "${BOLD}Options:${RESET}"
+	printf "  %-20s %s\n" "-f, --force" "Overwrite existing output file"
+	printf "  %-20s %s\n" "--help" "Show this help message"
+	echo ""
+	echo "${BOLD}Subcommands:${RESET}"
+	printf "  %-20s %s\n" "create" "Create package from source (legacy)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package /path/to/app v1.0.0"
+	echo "  appdeploy package /path/to/app myapp-1.0.0.tar.gz"
+	echo "  appdeploy package /path/to/app v1.0.0 -f"
+	echo "  appdeploy package create /path/to/app /output/myapp-1.0.0.tar.gz"
+}
+
+# Function: appdeploy_help_target
+# Shows help for the 'target' command
+function appdeploy_help_target() {
+	echo "${BOLD}appdeploy target - Manage deployment targets${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy target SUBCOMMAND [ARGS...]"
+	echo ""
+	echo "${BOLD}Subcommands:${RESET}"
+	printf "  %-20s %s\n" "install" "Install appdeploy structure on target"
+	printf "  %-20s %s\n" "check" "Check if target structure exists"
+	echo ""
+	echo "${BOLD}Arguments for 'install':${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	echo ""
+	echo "${BOLD}Arguments for 'check':${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy target install user@host:/opt/apps"
+	echo "  appdeploy target check user@host:/opt/apps"
+	echo "  appdeploy target install :/opt/apps"
+}
+
+# Function: appdeploy_help_package_upload
+# Shows help for the 'package-upload' command
+function appdeploy_help_package_upload() {
+	echo "${BOLD}appdeploy package-upload - Upload package to target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-upload TARGET PACKAGE [NAME] [VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Path to package archive file"
+	printf "  %-20s %s\n" "NAME" "Optional package name override"
+	printf "  %-20s %s\n" "VERSION" "Optional version override"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-upload user@host:/opt/apps myapp-1.0.0.tar.gz"
+	echo "  appdeploy package-upload user@host:/opt/apps myapp-1.0.0.tar.gz myapp v1.0.0"
+}
+
+# Function: appdeploy_help_package_install
+# Shows help for the 'package-install' command
+function appdeploy_help_package_install() {
+	echo "${BOLD}appdeploy package-install - Install package on target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-install TARGET PACKAGE[:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to latest)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-install user@host:/opt/apps myapp"
+	echo "  appdeploy package-install user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_activate
+# Shows help for the 'package-activate' command
+function appdeploy_help_package_activate() {
+	echo "${BOLD}appdeploy package-activate - Activate package on target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-activate TARGET PACKAGE[:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to latest)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-activate user@host:/opt/apps myapp"
+	echo "  appdeploy package-activate user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_deactivate
+# Shows help for the 'package-deactivate' command
+function appdeploy_help_package_deactivate() {
+	echo "${BOLD}appdeploy package-deactivate - Deactivate package on target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-deactivate TARGET PACKAGE[:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to active)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-deactivate user@host:/opt/apps myapp"
+	echo "  appdeploy package-deactivate user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_uninstall
+# Shows help for the 'package-uninstall' command
+function appdeploy_help_package_uninstall() {
+	echo "${BOLD}appdeploy package-uninstall - Uninstall package from target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-uninstall TARGET PACKAGE[:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to all)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-uninstall user@host:/opt/apps myapp"
+	echo "  appdeploy package-uninstall user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_remove
+# Shows help for the 'package-remove' command
+function appdeploy_help_package_remove() {
+	echo "${BOLD}appdeploy package-remove - Remove package from target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-remove TARGET PACKAGE[:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to all)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-remove user@host:/opt/apps myapp"
+	echo "  appdeploy package-remove user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_list
+# Shows help for the 'package-list' command
+function appdeploy_help_package_list() {
+	echo "${BOLD}appdeploy package-list - List packages on target${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-list TARGET [PACKAGE][:VERSION]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Optional package name filter"
+	printf "  %-20s %s\n" "VERSION" "Optional version filter"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-list user@host:/opt/apps"
+	echo "  appdeploy package-list user@host:/opt/apps myapp"
+	echo "  appdeploy package-list user@host:/opt/apps myapp:1.0.0"
+}
+
+# Function: appdeploy_help_package_deploy_conf
+# Shows help for the 'package-deploy-conf' command
+function appdeploy_help_package_deploy_conf() {
+	echo "${BOLD}appdeploy package-deploy-conf - Deploy configuration to package${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy package-deploy-conf TARGET PACKAGE[:VERSION] CONF_ARCHIVE"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "TARGET" "Target in format [user@]host:path"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (defaults to active)"
+	printf "  %-20s %s\n" "CONF_ARCHIVE" "Configuration archive file"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy package-deploy-conf user@host:/opt/apps myapp config.tar.gz"
+	echo "  appdeploy package-deploy-conf user@host:/opt/apps myapp:1.0.0 config.tar.gz"
+}
+
+# ----------------------------------------------------------------------------
+#
 # MAIN
-# 
+#
 # ----------------------------------------------------------------------------
 
 function appdeploy_cli() {
 	# Check if we have any arguments
 	if [[ $# -eq 0 ]]; then
-		# No arguments - show help or check default target
-		appdeploy_target_check ":$APPDEPLOY_TARGET"
+		# No arguments - show comprehensive help
+		appdeploy_show_help "true"
 		return 0
 	fi
 	
+	# Handle global options before parsing subcommand
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--help|-h)
+				appdeploy_show_help "true"
+				return 0
+				;;
+			--version|-v)
+				echo "appdeploy version $APPDEPLOY_VERSION"
+				return 0
+				;;
+			--debug)
+				DEBUG=1
+				;;
+			-*)
+				# Unknown global option, let subcommand handle it
+				break
+				;;
+			*)
+				# Not an option, break to parse subcommand
+				break
+				;;
+		esac
+		shift
+	done
+
+	# Check if we have any arguments left after processing global options
+	if [[ $# -eq 0 ]]; then
+		# No arguments left - show comprehensive help
+		appdeploy_show_help "true"
+		return 0
+	fi
+
 	# Parse subcommand
 	local subcommand="$1"
 	shift
-	
+
+	# Handle help requests for specific subcommands
+	if [[ "$subcommand" == "help" || ("$1" == "--help" || "$1" == "-h") ]]; then
+		local help_target="$subcommand"
+		if [[ "$help_target" == "help" ]]; then
+			# 'appdeploy help' - show general help
+			appdeploy_show_help "true"
+			return 0
+		elif [[ "$1" == "--help" || "$1" == "-h" ]]; then
+			# 'appdeploy COMMAND --help' - show help for specific command
+			shift
+		fi
+		
+		# Show help for the specified command
+		case "$help_target" in
+			run)
+				appdeploy_help_run
+				;;
+			package)
+				appdeploy_help_package
+				;;
+			target)
+				appdeploy_help_target
+				;;
+			package-upload)
+				appdeploy_help_package_upload
+				;;
+			package-install)
+				appdeploy_help_package_install
+				;;
+			package-activate)
+				appdeploy_help_package_activate
+				;;
+			package-deactivate)
+				appdeploy_help_package_deactivate
+				;;
+			package-uninstall)
+				appdeploy_help_package_uninstall
+				;;
+			package-remove)
+				appdeploy_help_package_remove
+				;;
+			package-list)
+				appdeploy_help_package_list
+				;;
+			package-deploy-conf)
+				appdeploy_help_package_deploy_conf
+				;;
+			*)
+				appdeploy_error "Unknown command: $help_target"
+				appdeploy_error "Use 'appdeploy --help' for usage information"
+				return 1
+				;;
+		esac
+		return 0
+	fi
+
 	case "$subcommand" in
 		run)
 			appdeploy_run "$@"
@@ -1665,8 +2026,7 @@ function appdeploy_cli() {
 		package)
 			# Handle package subcommands
 			if [[ $# -eq 0 ]]; then
-				appdeploy_error "Usage: appdeploy package PATH [VERSION|OUTPUT] [-f|--force]"
-				appdeploy_error "       appdeploy package create SOURCE DESTINATION"
+				appdeploy_help_package
 				return 1
 			fi
 			local package_subcommand="$1"
@@ -1675,7 +2035,7 @@ function appdeploy_cli() {
 					# Legacy: appdeploy package create SOURCE DESTINATION
 					shift
 					if [[ $# -lt 2 ]]; then
-						appdeploy_error "Usage: appdeploy package create SOURCE DESTINATION"
+						appdeploy_help_package
 						return 1
 					fi
 					appdeploy_package_create "$1" "$2"
@@ -1695,7 +2055,7 @@ function appdeploy_cli() {
 		target)
 			# Handle target subcommands
 			if [[ $# -eq 0 ]]; then
-				appdeploy_error "Missing target subcommand"
+				appdeploy_help_target
 				return 1
 			fi
 			local target_subcommand="$1"
@@ -1703,20 +2063,21 @@ function appdeploy_cli() {
 			case "$target_subcommand" in
 				install)
 					if [[ $# -lt 1 ]]; then
-						appdeploy_error "Usage: appdeploy target install TARGET"
+						appdeploy_help_target
 						return 1
 					fi
 					appdeploy_target_install "$1"
 				;;
 				check)
 					if [[ $# -lt 1 ]]; then
-						appdeploy_error "Usage: appdeploy target check TARGET"
+						appdeploy_help_target
 						return 1
 					fi
 					appdeploy_target_check "$1"
 				;;
 				*)
 					appdeploy_error "Unknown target subcommand: $target_subcommand"
+					appdeploy_help_target
 					return 1
 				;;
 			esac
@@ -1746,20 +2107,7 @@ function appdeploy_cli() {
 			appdeploy_package_deploy_conf "$@"
 		;;
 		--help|-h|help)
-			echo "Usage: appdeploy [--version] [--help]"
-			echo "       appdeploy run PACKAGE_ARCHIVE [-c CONF_ARCHIVE] [-r RUN_PATH] [OVERLAY_PATHS...]"
-			echo "       appdeploy package PATH [VERSION|OUTPUT] [-f|--force]"
-			echo "       appdeploy package create SOURCE DESTINATION"
-			echo "       appdeploy target install TARGET"
-			echo "       appdeploy target check TARGET"
-			echo "       appdeploy package-upload TARGET PACKAGE [NAME] [VERSION]"
-			echo "       appdeploy package-install TARGET PACKAGE[:VERSION]"
-			echo "       appdeploy package-activate TARGET PACKAGE[:VERSION]"
-			echo "       appdeploy package-deactivate TARGET PACKAGE[:VERSION]"
-			echo "       appdeploy package-uninstall TARGET PACKAGE[:VERSION]"
-			echo "       appdeploy package-remove TARGET PACKAGE[:VERSION]"
-			echo "       appdeploy package-list TARGET [PACKAGE][:VERSION]"
-			echo "       appdeploy package-deploy-conf TARGET PACKAGE[:VERSION] CONF_ARCHIVE"
+			appdeploy_show_help "true"
 		;;
 		--version|-v)
 			echo "appdeploy version $APPDEPLOY_VERSION"
