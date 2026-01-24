@@ -205,9 +205,9 @@ function appdeploy_error() {
 }
 
 # Function: appdeploy_info MESSAGE
-# Outputs an informational message in green
+# Outputs an informational event message in green
 function appdeploy_info() {
-	local prefix="_i_"
+	local prefix="<|>"
 	printf '%s%s %s%s\n' "$GREEN" "$prefix" "$*" "$RESET"
 }
 
@@ -215,9 +215,62 @@ function appdeploy_info() {
 # Outputs a debug message in gray (only shown when DEBUG=1)
 function appdeploy_debug() {
 	if [ -n "${DEBUG:-}" ]; then
-		local prefix="_d_"
+		local prefix="[debug] _._"
 		printf '%s%s %s%s\n' "$GRAY" "$prefix" "$*" "$RESET"
 	fi
+}
+
+# ============================================================================
+# PROCESS LOGGING (rap-2025 format)
+# ============================================================================
+
+# Function: appdeploy_program NAME
+# Outputs a program start marker: >-- NAME
+function appdeploy_program() {
+	local prefix=">--"
+	printf '%s%s %s%s\n' "$BOLD" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_step MESSAGE
+# Outputs a step marker: --> MESSAGE
+function appdeploy_step() {
+	local prefix="-->"
+	printf '%s%s %s%s\n' "$BLUE" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_step_ok MESSAGE
+# Outputs a step success marker: <OK MESSAGE
+function appdeploy_step_ok() {
+	local prefix="<OK"
+	printf '%s%s %s%s\n' "$GREEN" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_step_fail MESSAGE
+# Outputs a step failure marker: <!! MESSAGE
+function appdeploy_step_fail() {
+	local prefix="<!!"
+	printf '%s%s %s%s\n' "$RED" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_result MESSAGE
+# Outputs a result marker: <-- MESSAGE
+function appdeploy_result() {
+	local prefix="<--"
+	printf '%s%s %s%s\n' "$GRAY" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_program_ok MESSAGE
+# Outputs a program success marker: EOK MESSAGE
+function appdeploy_program_ok() {
+	local prefix="EOK"
+	printf '%s%s %s%s\n' "$GREEN" "$prefix" "$*" "$RESET"
+}
+
+# Function: appdeploy_program_fail MESSAGE
+# Outputs a program failure marker: E!! MESSAGE
+function appdeploy_program_fail() {
+	local prefix="E!!"
+	printf '%s%s %s%s\n' "$RED" "$prefix" "$*" "$RESET"
 }
 
 # ============================================================================
@@ -506,7 +559,8 @@ function appdeploy_package_upload() {
 	local dest_dir="$path/$name/packages"
 	local dest_file="$name-$version.tar.$ext"
 	
-	appdeploy_log "Uploading $(appdeploy_format_path "$package") to $(appdeploy_format_path "$target") as $(appdeploy_format_path "$dest_file")"
+	appdeploy_program "Upload package $name:$version"
+	appdeploy_step "Uploading $(appdeploy_format_path "$package") to $(appdeploy_format_path "$target")"
 	
 	# Ensure destination directory exists
 	local escaped_dest_dir
@@ -516,18 +570,18 @@ function appdeploy_package_upload() {
 	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
 		# Local copy
 		if ! cp "$package" "${dest_dir}/${dest_file}"; then
-			appdeploy_error "Failed to copy package"
+			appdeploy_step_fail "Failed to copy package"
 			return 1
 		fi
 	else
 		# Upload using rsync
 		if ! rsync -az --progress "$package" "${user}@${host}:${dest_dir}/${dest_file}"; then
-			appdeploy_error "Failed to upload package"
+			appdeploy_step_fail "Failed to upload package"
 			return 1
 		fi
 	fi
 	
-	appdeploy_log "Successfully uploaded $(appdeploy_format_path "$dest_file")"
+	appdeploy_step_ok "Uploaded $(appdeploy_format_path "$dest_file")"
 }
 
 # Function: appdeploy_package_install TARGET PACKAGE[:VERSION]
@@ -608,11 +662,12 @@ function appdeploy_package_install() {
 	
 	# Check if already installed
 	if appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
-		appdeploy_log "Package $name:$version is already installed"
+		appdeploy_info "Package $name:$version is already installed"
 		return 0
 	fi
 	
-	appdeploy_log "Installing $(appdeploy_format_path "$name:$version")"
+	appdeploy_program "Install package $name:$version"
+	appdeploy_step "Extracting to $(appdeploy_format_path "$dist_dir/$version")"
 	
 	# Escape pkg_file for the command
 	local escaped_pkg_file
@@ -620,11 +675,11 @@ function appdeploy_package_install() {
 	
 	# Create dist directory and extract
 	if ! appdeploy_cmd_run "$target" "mkdir -p '${escaped_dist_dir}/${escaped_version}' && tar $tar_opts '${escaped_pkg_file}' -C '${escaped_dist_dir}/${escaped_version}'"; then
-		appdeploy_error "Failed to extract package"
+		appdeploy_step_fail "Failed to extract package"
 		return 1
 	fi
 	
-	appdeploy_log "Successfully installed $(appdeploy_format_path "$name:$version") to $(appdeploy_format_path "$dist_dir/$version")"
+	appdeploy_step_ok "Installed $(appdeploy_format_path "$name:$version")"
 }
 
 # Function: appdeploy_package_activate TARGET PACKAGE[:VERSION]
@@ -700,12 +755,13 @@ function appdeploy_package_activate() {
 	if ! appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
 		appdeploy_log "Package not installed, installing first..."
 		if ! appdeploy_package_install "$target" "$name:$version"; then
-			appdeploy_error "Failed to install package"
+			appdeploy_step_fail "Failed to install package"
 			return 1
 		fi
 	fi
 	
-	appdeploy_log "Activating $(appdeploy_format_path "$name:$version")"
+	appdeploy_program "Activate package $name:$version"
+	appdeploy_step "Creating symlinks in $(appdeploy_format_path "$run_dir")"
 	
 	# Create run and var directories
 	appdeploy_cmd_run "$target" "mkdir -p '${escaped_run_dir}' '${escaped_var_dir}'"
@@ -722,7 +778,7 @@ function appdeploy_package_activate() {
 	# Store active version marker
 	appdeploy_cmd_run "$target" "echo '${escaped_version}' > '${escaped_path}/${escaped_name}/.active'"
 	
-	appdeploy_log "Successfully activated $(appdeploy_format_path "$name:$version")"
+	appdeploy_step_ok "Activated $(appdeploy_format_path "$name:$version")"
 }
 
 # Function: appdeploy_package_deactivate TARGET PACKAGE[:VERSION]
@@ -763,17 +819,18 @@ function appdeploy_package_deactivate() {
 	active_version=$(appdeploy_cmd_run "$target" "cat '${escaped_active_file}' 2>/dev/null" || true)
 	
 	if [[ -z "$active_version" ]]; then
-		appdeploy_log "No active version for $name"
+		appdeploy_info "No active version for $name"
 		return 0
 	fi
 	
 	# If a specific version was requested, check if it matches
 	if [[ -n "$version" && "$version" != "$active_version" ]]; then
-		appdeploy_log "$name:$version is not active (active: $active_version)"
+		appdeploy_info "$name:$version is not active (active: $active_version)"
 		return 0
 	fi
 	
-	appdeploy_log "Deactivating $name:$active_version"
+	appdeploy_program "Deactivate package $name:$active_version"
+	appdeploy_step "Removing symlinks from $(appdeploy_format_path "$run_dir")"
 	
 	# Remove all symlinks in run directory
 	appdeploy_cmd_run "$target" "find '${escaped_run_dir}' -maxdepth 1 -type l -delete"
@@ -781,7 +838,7 @@ function appdeploy_package_deactivate() {
 	# Remove active marker
 	appdeploy_cmd_run "$target" "rm -f '${escaped_active_file}'"
 	
-	appdeploy_log "Successfully deactivated $name:$active_version"
+	appdeploy_step_ok "Deactivated $name:$active_version"
 }
 
 # Function: appdeploy_package_uninstall TARGET PACKAGE[:VERSION]
@@ -826,7 +883,7 @@ function appdeploy_package_uninstall() {
 		local versions
 		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9]'")
 		if [[ -z "$versions" ]]; then
-			appdeploy_log "No installed versions for $name"
+			appdeploy_info "No installed versions for $name"
 			return 0
 		fi
 		for v in $versions; do
@@ -840,7 +897,7 @@ function appdeploy_package_uninstall() {
 	
 	# Check if version is installed
 	if ! appdeploy_cmd_run "$target" "test -d '${escaped_dist_dir}/${escaped_version}'" 2>/dev/null; then
-		appdeploy_log "$name:$version is not installed"
+		appdeploy_info "$name:$version is not installed"
 		return 0
 	fi
 	
@@ -850,13 +907,14 @@ function appdeploy_package_uninstall() {
 		appdeploy_package_deactivate "$target" "$name:$version"
 	fi
 	
-	appdeploy_log "Uninstalling $name:$version"
+	appdeploy_program "Uninstall package $name:$version"
+	appdeploy_step "Removing $(appdeploy_format_path "$dist_dir/$version")"
 	
 	# Remove the dist directory for this version
 	# Files are read-only (555/444), so we need to restore write permissions first
 	appdeploy_cmd_run "$target" "chmod -R u+w '${escaped_dist_dir}/${escaped_version}' && rm -rf '${escaped_dist_dir}/${escaped_version}'"
 	
-	appdeploy_log "Successfully uninstalled $name:$version (archive kept)"
+	appdeploy_step_ok "Uninstalled $name:$version (archive kept)"
 }
 
 # Function: appdeploy_package_remove TARGET PACKAGE[:VERSION]
@@ -896,7 +954,7 @@ function appdeploy_package_remove() {
 		local versions
 		versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_name}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_name}-//;s/\\.tar\\.(gz|bz2|xz)\$//'")
 		if [[ -z "$versions" ]]; then
-			appdeploy_log "No packages found for $name"
+			appdeploy_info "No packages found for $name"
 			return 0
 		fi
 		for v in $versions; do
@@ -911,12 +969,13 @@ function appdeploy_package_remove() {
 	# Uninstall first (this handles deactivation too)
 	appdeploy_package_uninstall "$target" "$name:$version"
 	
-	appdeploy_log "Removing package archive for $name:$version"
+	appdeploy_program "Remove package $name:$version"
+	appdeploy_step "Removing archive from $(appdeploy_format_path "$pkg_dir")"
 	
 	# Remove the package archive
 	appdeploy_cmd_run "$target" "rm -f '${escaped_pkg_dir}/${escaped_name}-${escaped_version}'.tar.*"
 	
-	appdeploy_log "Successfully removed $name:$version"
+	appdeploy_step_ok "Removed $name:$version"
 }
 
 # Function: appdeploy_package_list TARGET [PACKAGE][:VERSION]
@@ -1268,22 +1327,25 @@ function appdeploy_package_create () {
 		mkdir -p "$dest_dir"
 	fi
 	
-	appdeploy_log "Creating package $(appdeploy_format_path "$name-$version") from $(appdeploy_format_path "$source")"
+	appdeploy_program "Create package $name-$version"
+	appdeploy_step "Staging from $(appdeploy_format_path "$source")"
 	
 	# Create staging directory for readonly copy
 	local staging
 	staging=$(mktemp -d) || {
-		appdeploy_error "Failed to create staging directory"
+		appdeploy_step_fail "Failed to create staging directory"
 		return 1
 	}
 	
 	# Copy source to staging
 	if ! cp -a "$source/." "$staging/"; then
-		appdeploy_error "Failed to copy source to staging directory"
+		appdeploy_step_fail "Failed to copy source to staging directory"
 		chmod -R u+w "$staging" 2>/dev/null || true
 		rm -rf "$staging"
 		return 1
 	fi
+	
+	appdeploy_step "Setting permissions (readonly)"
 	
 	# Make all files readonly, preserving +x flag
 	# Files: readable by all, executable only if originally executable
@@ -1298,9 +1360,11 @@ function appdeploy_package_create () {
 	# Make directories readonly (r-xr-xr-x)
 	find "$staging" -type d -exec chmod 555 {} \;
 	
+	appdeploy_step "Creating tarball $(appdeploy_format_path "$destination")"
+	
 	# Create the tarball from the staging directory contents
 	if ! tar $tar_opts "$destination" -C "$staging" .; then
-		appdeploy_error "Failed to create package"
+		appdeploy_step_fail "Failed to create package"
 		chmod -R u+w "$staging" 2>/dev/null || true
 		rm -rf "$staging"
 		return 1
@@ -1310,7 +1374,7 @@ function appdeploy_package_create () {
 	chmod -R u+w "$staging" 2>/dev/null || true
 	rm -rf "$staging"
 	
-	appdeploy_log "Successfully created package: $(appdeploy_format_path "$destination")"
+	appdeploy_step_ok "Created package $(appdeploy_format_path "$destination")"
 }
 
 # Function: appdeploy_package PATH [VERSION|OUTPUT] [-f|--force]
@@ -1458,37 +1522,47 @@ function appdeploy_package_run() {
 		return 1
 	fi
 	
-	appdeploy_log "Running package $(appdeploy_format_path "$name:$version") in $(appdeploy_format_path "$target")"
+	appdeploy_program "Run package $name:$version"
 	
-	# Install target structure
+	# Step 1: Install target structure
+	appdeploy_step "#1/5 Installing target structure"
 	if ! appdeploy_target_install "$target"; then
-		appdeploy_error "Failed to install target structure"
+		appdeploy_step_fail "#1/5 Failed to install target structure"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
-	# Upload package to target
+	# Step 2: Upload package to target
+	appdeploy_step "#2/5 Uploading package"
 	if ! appdeploy_package_upload "$target" "$package_archive" "$name" "$version"; then
-		appdeploy_error "Failed to upload package"
+		appdeploy_step_fail "#2/5 Failed to upload package"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
-	# Install package
+	# Step 3: Install package
+	appdeploy_step "#3/5 Installing package"
 	if ! appdeploy_package_install "$target" "$name:$version"; then
-		appdeploy_error "Failed to install package"
+		appdeploy_step_fail "#3/5 Failed to install package"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
-	# Deploy configuration if provided
+	# Step 4: Deploy configuration if provided
 	if [[ -n "$conf_archive" ]]; then
+		appdeploy_step "#4/5 Deploying configuration"
 		if ! appdeploy_package_deploy_conf "$target" "$name:$version" "$conf_archive"; then
-			appdeploy_error "Failed to deploy configuration"
+			appdeploy_step_fail "#4/5 Failed to deploy configuration"
+			appdeploy_program_fail "Run package $name:$version"
 			return 1
 		fi
 	fi
 	
-	# Activate package
+	# Step 5: Activate package
+	appdeploy_step "#5/5 Activating package"
 	if ! appdeploy_package_activate "$target" "$name:$version"; then
-		appdeploy_error "Failed to activate package"
+		appdeploy_step_fail "#5/5 Failed to activate package"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
@@ -1527,49 +1601,58 @@ function appdeploy_package_run() {
 	
 	# Check required files exist and are executable
 	if [[ ! -f "$env_file" ]]; then
-		appdeploy_error "Required file env.sh not found in package"
+		appdeploy_step_fail "Required file env.sh not found in package"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	if [[ ! -x "$env_file" ]]; then
-		appdeploy_error "Required file env.sh is not executable"
+		appdeploy_step_fail "Required file env.sh is not executable"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
 	if [[ ! -f "$run_file" ]]; then
-		appdeploy_error "Required file run.sh not found in package"
+		appdeploy_step_fail "Required file run.sh not found in package"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	if [[ ! -x "$run_file" ]]; then
-		appdeploy_error "Required file run.sh is not executable"
+		appdeploy_step_fail "Required file run.sh is not executable"
+		appdeploy_program_fail "Run package $name:$version"
 		return 1
 	fi
 	
 	# Handle dry run - skip execution
 	if [[ "$dry_run" == "true" ]]; then
-		appdeploy_log "Dry run mode - package $(appdeploy_format_path "$name:$version") set up at $(appdeploy_format_path "$run_dir")"
-		appdeploy_log "Skipping execution of env.sh and run.sh"
+		appdeploy_info "Dry run mode - package set up at $(appdeploy_format_path "$run_dir")"
+		appdeploy_program_ok "Run package $name:$version (dry run)"
 		return 0
 	fi
 	
 	# Execute the application
-	appdeploy_log "Starting application $(appdeploy_format_path "$name:$version")"
+	appdeploy_step "Executing application"
 	start_time=$(date +%s)
 	
 	# Execute with proper environment
 	# Use bash -c to source env.sh and then execute run.sh in the same shell
 	if ! bash -c "source '${env_file}' && '${run_file}'"; then
 		exit_status=$?
-		appdeploy_error "Application exited with status $exit_status"
+		appdeploy_step_fail "Application exited with status $exit_status"
 	else
 		exit_status=0
-		appdeploy_log "Application completed successfully"
+		appdeploy_step_ok "Application completed"
 	fi
 	
 	end_time=$(date +%s)
 	runtime=$((end_time - start_time))
 	
-	appdeploy_log "Runtime: ${runtime}s"
-	appdeploy_log "Exit status: ${exit_status}"
+	appdeploy_result "Runtime: ${runtime}s, exit: ${exit_status}"
+	
+	if [[ $exit_status -eq 0 ]]; then
+		appdeploy_program_ok "Run package $name:$version"
+	else
+		appdeploy_program_fail "Run package $name:$version"
+	fi
 	
 	return $exit_status
 }
@@ -1595,7 +1678,8 @@ function appdeploy_target_install() {
 		return 1
 	fi
 	
-	appdeploy_log "Installing appdeploy directory structure on $(appdeploy_format_path "$target")"
+	appdeploy_program "Install target structure"
+	appdeploy_step "Creating $(appdeploy_format_path "$path")"
 	
 	local escaped_path
 	escaped_path=$(appdeploy_escape_single_quotes "$path")
@@ -1603,7 +1687,7 @@ function appdeploy_target_install() {
 	# Create base directory
 	appdeploy_cmd_run "$target" "mkdir -p '${escaped_path}'"
 	
-	appdeploy_log "Successfully installed appdeploy on $(appdeploy_format_path "$target") at $(appdeploy_format_path "$path")"
+	appdeploy_step_ok "Installed on $(appdeploy_format_path "$target")"
 }
 
 # Function: appdeploy_target_check TARGET
@@ -1934,10 +2018,13 @@ function appdeploy_deploy() {
 		return 1
 	fi
 	
+	appdeploy_program "Deploy to $target"
+	
 	# Step 1: Terraform target configuration
-	appdeploy_log "${BOLD}Step 1/8: Configuring target with terraform${RESET}"
+	appdeploy_step "#1/8 Configuring target with terraform"
 	if ! appdeploy_terraform_apply "$target"; then
-		appdeploy_error "Failed to configure target with terraform"
+		appdeploy_step_fail "#1/8 Failed to configure target with terraform"
+		appdeploy_program_fail "Deploy to $target"
 		return 1
 	fi
 	
@@ -1946,7 +2033,7 @@ function appdeploy_deploy() {
 	local is_directory=false
 	
 	if [[ -d "$package_path" ]]; then
-		appdeploy_log "${BOLD}Step 2/8: Creating package archive${RESET}"
+		appdeploy_step "#2/8 Creating package archive"
 		is_directory=true
 		
 		# Determine package name and version
@@ -1985,12 +2072,12 @@ function appdeploy_deploy() {
 		temp_archive=$(mktemp -t "${package_name}-${package_version}.XXXXXX.tar.gz")
 		
 		if ! appdeploy_package_create "$package_path" "$temp_archive" "true"; then
-			appdeploy_error "Failed to create package archive"
+			appdeploy_step_fail "#2/8 Failed to create package archive"
+			appdeploy_program_fail "Deploy to $target"
 			return 1
 		fi
 		
 		package_archive="$temp_archive"
-		appdeploy_log "Created package archive: $package_archive"
 	fi
 	
 	# Extract package name and version from archive
@@ -2000,19 +2087,21 @@ function appdeploy_deploy() {
 	package_version=$(appdeploy_package_version "$(basename "$package_archive")")
 	
 	if [[ -z "$package_name" ]] || [[ -z "$package_version" ]]; then
-		appdeploy_error "Failed to extract package name and version from archive"
+		appdeploy_step_fail "Failed to extract package name and version from archive"
+		appdeploy_program_fail "Deploy to $target"
 		if [[ "$is_directory" == true ]]; then
 			rm -f "$package_archive"
 		fi
 		return 1
 	fi
 	
-	appdeploy_log "Deploying package: ${package_name}:${package_version}"
+	appdeploy_info "Deploying ${package_name}:${package_version}"
 	
 	# Step 3: Upload package
-	appdeploy_log "${BOLD}Step 3/8: Uploading package to target${RESET}"
+	appdeploy_step "#3/8 Uploading package to target"
 	if ! appdeploy_package_upload "$target" "$package_archive"; then
-		appdeploy_error "Failed to upload package to target"
+		appdeploy_step_fail "#3/8 Failed to upload package to target"
+		appdeploy_program_fail "Deploy to $target"
 		if [[ "$is_directory" == true ]]; then
 			rm -f "$package_archive"
 		fi
@@ -2025,55 +2114,55 @@ function appdeploy_deploy() {
 	fi
 	
 	# Step 4: Install package
-	appdeploy_log "${BOLD}Step 4/8: Installing package on target${RESET}"
+	appdeploy_step "#4/8 Installing package on target"
 	if ! appdeploy_package_install "$target" "${package_name}:${package_version}"; then
-		appdeploy_error "Failed to install package on target"
+		appdeploy_step_fail "#4/8 Failed to install package on target"
+		appdeploy_program_fail "Deploy to $target"
 		return 1
 	fi
 	
 	# Step 5: Deactivate current package if any
-	appdeploy_log "${BOLD}Step 5/8: Deactivating current package${RESET}"
+	appdeploy_step "#5/8 Deactivating current package"
 	local current_package
 	current_package=$(appdeploy_package_current "$target" "$package_name")
 	
 	if [[ -n "$current_package" ]]; then
 		appdeploy_log "Deactivating current package: $current_package"
 		if ! appdeploy_package_deactivate "$target" "$package_name"; then
-			appdeploy_error "Failed to deactivate current package"
+			appdeploy_step_fail "#5/8 Failed to deactivate current package"
+			appdeploy_program_fail "Deploy to $target"
 			return 1
 		fi
 	else
-		appdeploy_log "No current package to deactivate"
+		appdeploy_info "No current package to deactivate"
 	fi
 	
 	# Step 6: Activate new package
-	appdeploy_log "${BOLD}Step 6/8: Activating new package${RESET}"
+	appdeploy_step "#6/8 Activating new package"
 	if ! appdeploy_package_activate "$target" "${package_name}:${package_version}"; then
-		appdeploy_error "Failed to activate new package"
+		appdeploy_step_fail "#6/8 Failed to activate new package"
+		appdeploy_program_fail "Deploy to $target"
 		return 1
 	fi
 	
 	# Step 7: Deploy configuration if provided
 	if [[ -n "$conf_archive" ]]; then
-		appdeploy_log "${BOLD}Step 7/8: Deploying configuration${RESET}"
+		appdeploy_step "#7/8 Deploying configuration"
 		if ! appdeploy_package_deploy_conf "$target" "${package_name}:${package_version}" "$conf_archive"; then
-			appdeploy_error "Failed to deploy configuration"
+			appdeploy_step_fail "#7/8 Failed to deploy configuration"
+			appdeploy_program_fail "Deploy to $target"
 			return 1
 		fi
 	else
-		appdeploy_log "${BOLD}Step 7/8: No configuration to deploy${RESET}"
+		appdeploy_step "#7/8 No configuration to deploy"
 	fi
 	
-	# Step 8: Start the package
-	appdeploy_log "${BOLD}Step 8/8: Starting package${RESET}"
+	# Step 8: Ready to start
+	appdeploy_step "#8/8 Package ready"
+	appdeploy_result "Package ${package_name}:${package_version} is ready on ${target}"
+	appdeploy_result "To start: appdeploy run ${package_name}-${package_version}.tar.gz"
 	
-	# For now, just log that the package is ready to start
-	# In a full implementation, this would execute the run.sh script
-	appdeploy_log "Package ${package_name}:${package_version} is ready to start on ${target}"
-	appdeploy_log "To start the package manually, run: appdeploy run ${package_name}-${package_version}.tar.gz"
-	
-	appdeploy_log "${GREEN}Deployment completed successfully!${RESET}"
-	appdeploy_log "Package ${package_name}:${package_version} is now running on ${target}"
+	appdeploy_program_ok "Deploy ${package_name}:${package_version} to $target"
 	
 	return 0
 }
