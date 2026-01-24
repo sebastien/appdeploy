@@ -180,6 +180,123 @@ function appdeploy_make_temp_file() {
 }
 
 # ============================================================================
+# RUNNER DEPLOYMENT
+# ============================================================================
+
+# Function: appdeploy_runner_path
+# Returns the path to the runner script (sibling of this script)
+function appdeploy_runner_path() {
+	local script_path
+	script_path=$(realpath "${BASH_SOURCE[0]}")
+	printf '%s/appdeploy.runner.sh' "$(dirname "$script_path")"
+}
+
+# Function: appdeploy_runner_deploy TARGET
+# Deploys the runner script to $TARGET_PATH/appdeploy.runner.sh
+function appdeploy_runner_deploy() {
+	local target="$1"
+	local runner_src
+	runner_src=$(appdeploy_runner_path)
+	
+	if [[ ! -f "$runner_src" ]]; then
+		appdeploy_error "Runner script not found: $runner_src"
+		return 1
+	fi
+	
+	local path user host
+	path=$(appdeploy_target_path "$target")
+	user=$(appdeploy_target_user "$target")
+	host=$(appdeploy_target_host "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local runner_dest="$path/appdeploy.runner.sh"
+	local escaped_dest
+	escaped_dest=$(appdeploy_escape_single_quotes "$runner_dest")
+	
+	appdeploy_debug "Deploying runner to $runner_dest"
+	
+	if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+		# Local copy
+		if ! cp "$runner_src" "$runner_dest"; then
+			appdeploy_error "Failed to copy runner script"
+			return 1
+		fi
+		chmod 755 "$runner_dest"
+	else
+		# Remote copy via rsync
+		if ! rsync -az "$runner_src" "${user}@${host}:${runner_dest}"; then
+			appdeploy_error "Failed to deploy runner script to remote"
+			return 1
+		fi
+		ssh -o BatchMode=yes -- "${user}@${host}" "chmod 755 '${escaped_dest}'"
+	fi
+	
+	appdeploy_debug "Runner deployed successfully"
+	return 0
+}
+
+# Function: appdeploy_runner_ensure TARGET
+# Ensures runner is deployed (idempotent, checks if exists)
+function appdeploy_runner_ensure() {
+	local target="$1"
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local runner_dest="$path/appdeploy.runner.sh"
+	local escaped_dest
+	escaped_dest=$(appdeploy_escape_single_quotes "$runner_dest")
+	
+	# Check if runner exists on target
+	if ! appdeploy_cmd_run "$target" "test -x '${escaped_dest}'" 2>/dev/null; then
+		appdeploy_log "Deploying runner script to target"
+		appdeploy_runner_deploy "$target"
+	fi
+}
+
+# Function: appdeploy_runner_invoke TARGET PACKAGE COMMAND [ARGS...]
+# Invokes the runner script on target with proper environment
+function appdeploy_runner_invoke() {
+	local target="$1"
+	local package="$2"
+	local cmd="$3"
+	shift 3
+	local args="$*"
+	
+	local path user
+	path=$(appdeploy_target_path "$target")
+	user=$(appdeploy_target_user "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	if ! appdeploy_validate_name "$package"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_package
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_package=$(appdeploy_escape_single_quotes "$package")
+	
+	# Build environment variables for runner
+	local env_vars="APP_NAME='${escaped_package}'"
+	env_vars+=" APP_SCRIPT='${escaped_path}/${escaped_package}/run/run.sh'"
+	env_vars+=" LOG_DIR='${escaped_path}/${escaped_package}/var/logs'"
+	env_vars+=" PID_FILE='${escaped_path}/${escaped_package}/.pid'"
+	[[ -n "$user" ]] && env_vars+=" RUN_USER='${user}'"
+	env_vars+=" USE_SYSTEMD=auto"
+	
+	# Invoke runner
+	appdeploy_cmd_run "$target" "${env_vars} '${escaped_path}/appdeploy.runner.sh' ${cmd} ${args}"
+}
+
+# ============================================================================
 # LOGGING
 # ============================================================================
 
@@ -794,8 +911,16 @@ function appdeploy_package_activate() {
 	# Overlay symlinks from var to run (these take precedence)
 	appdeploy_cmd_run "$target" "for item in '${escaped_var_dir}'/*; do [ -e \"\$item\" ] && ln -sf \"\$item\" '${escaped_run_dir}/'; done; true"
 	
-	# Store active version marker
+	# Store active version marker (save previous active to .last-active first)
+	appdeploy_cmd_run "$target" "[ -f '${escaped_path}/${escaped_name}/.active' ] && cp '${escaped_path}/${escaped_name}/.active' '${escaped_path}/${escaped_name}/.last-active' 2>/dev/null || true"
 	appdeploy_cmd_run "$target" "echo '${escaped_version}' > '${escaped_path}/${escaped_name}/.active'"
+	
+	# Create var/logs directory for service logs
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_var_dir}/logs'"
+	
+	# Deploy runner script to target
+	appdeploy_step "Deploying runner script"
+	appdeploy_runner_ensure "$target"
 	
 	appdeploy_step_ok "Activated $(appdeploy_format_path "$name:$version")"
 }
@@ -1832,6 +1957,387 @@ function appdeploy_run() {
 
 # ----------------------------------------------------------------------------
 #
+# SERVICE MANAGEMENT
+#
+# ----------------------------------------------------------------------------
+
+# Function: appdeploy_service_resolve_version TARGET PACKAGE [VERSION]
+# Resolves version using priority: active > last-active > latest
+# Returns the resolved version string, or empty if no version found
+function appdeploy_service_resolve_version() {
+	local target="$1"
+	local package="$2"
+	local version="${3:-}"
+	
+	# If version specified, return it
+	if [[ -n "$version" ]]; then
+		printf '%s' "$version"
+		return 0
+	fi
+	
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_package
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_package=$(appdeploy_escape_single_quotes "$package")
+	
+	# Try active version
+	local active
+	active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_package}/.active' 2>/dev/null" || true)
+	if [[ -n "$active" ]]; then
+		printf '%s' "$active"
+		return 0
+	fi
+	
+	# Try last-active version
+	local last_active
+	last_active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_package}/.last-active' 2>/dev/null" || true)
+	if [[ -n "$last_active" ]]; then
+		printf '%s' "$last_active"
+		return 0
+	fi
+	
+	# Fall back to latest installed version
+	local dist_dir="$path/$package/dist"
+	local escaped_dist_dir
+	escaped_dist_dir=$(appdeploy_escape_single_quotes "$dist_dir")
+	
+	local installed_versions
+	installed_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9a-zA-Z]' || true")
+	
+	if [[ -n "$installed_versions" ]]; then
+		local version_list=()
+		readarray -t version_list <<< "$installed_versions"
+		local latest
+		latest=$(appdeploy_version_latest "${version_list[@]}")
+		if [[ -n "$latest" ]]; then
+			printf '%s' "$latest"
+			return 0
+		fi
+	fi
+	
+	# Fall back to latest uploaded package
+	local pkg_dir="$path/$package/packages"
+	local escaped_pkg_dir
+	escaped_pkg_dir=$(appdeploy_escape_single_quotes "$pkg_dir")
+	
+	local pkg_versions
+	pkg_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_package}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_package}-//;s/\\.tar\\.(gz|bz2|xz)\$//' || true")
+	
+	if [[ -n "$pkg_versions" ]]; then
+		local version_list=()
+		readarray -t version_list <<< "$pkg_versions"
+		local latest
+		latest=$(appdeploy_version_latest "${version_list[@]}")
+		if [[ -n "$latest" ]]; then
+			printf '%s' "$latest"
+			return 0
+		fi
+	fi
+	
+	# No version found
+	return 1
+}
+
+# Function: appdeploy_service_start TARGET PACKAGE[:VERSION]
+# Starts the service daemon, auto-activating if needed
+function appdeploy_service_start() {
+	local target="$1"
+	local spec="$2"
+	local name version
+	read -r name version <<< "$(appdeploy_package_parse "$spec")"
+	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	# Resolve version
+	version=$(appdeploy_service_resolve_version "$target" "$name" "$version")
+	if [[ -z "$version" ]]; then
+		appdeploy_error "No version found for $name on $target"
+		appdeploy_log "Upload a package first with: appdeploy upload PACKAGE $target"
+		return 1
+	fi
+	
+	# Validate resolved version
+	if ! appdeploy_validate_version "$version"; then
+		return 1
+	fi
+	
+	appdeploy_program "Start service $name:$version"
+	
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_name escaped_version
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
+	# Ensure runner is deployed
+	appdeploy_step "Ensuring runner is deployed"
+	appdeploy_runner_ensure "$target"
+	
+	# Check if activated, auto-activate if needed
+	local active
+	active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_name}/.active' 2>/dev/null" || true)
+	
+	if [[ -z "$active" || "$active" != "$version" ]]; then
+		appdeploy_step "Auto-activating $name:$version"
+		if ! appdeploy_package_activate "$target" "$name:$version"; then
+			appdeploy_step_fail "Failed to activate package"
+			appdeploy_program_fail "Start service $name:$version"
+			return 1
+		fi
+	fi
+	
+	# Create logs directory
+	appdeploy_cmd_run "$target" "mkdir -p '${escaped_path}/${escaped_name}/var/logs'"
+	
+	# Invoke runner start
+	appdeploy_step "Starting service"
+	if ! appdeploy_runner_invoke "$target" "$name" "start"; then
+		appdeploy_step_fail "Failed to start service"
+		appdeploy_program_fail "Start service $name:$version"
+		return 1
+	fi
+	
+	appdeploy_step_ok "Service started"
+	appdeploy_program_ok "Start service $name:$version"
+	return 0
+}
+
+# Function: appdeploy_service_stop TARGET PACKAGE[:VERSION]
+# Stops the service daemon (does not deactivate)
+function appdeploy_service_stop() {
+	local target="$1"
+	local spec="$2"
+	local name version
+	read -r name version <<< "$(appdeploy_package_parse "$spec")"
+	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	# Resolve version (for logging, stop works on any running instance)
+	version=$(appdeploy_service_resolve_version "$target" "$name" "$version")
+	if [[ -z "$version" ]]; then
+		version="(unknown)"
+	fi
+	
+	appdeploy_program "Stop service $name:$version"
+	
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_name
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	
+	# Check if runner exists
+	if ! appdeploy_cmd_run "$target" "test -x '${escaped_path}/appdeploy.runner.sh'" 2>/dev/null; then
+		appdeploy_info "Runner not deployed, service likely not running"
+		appdeploy_program_ok "Stop service $name:$version"
+		return 0
+	fi
+	
+	# Invoke runner stop
+	appdeploy_step "Stopping service"
+	if ! appdeploy_runner_invoke "$target" "$name" "stop"; then
+		appdeploy_step_fail "Failed to stop service"
+		appdeploy_program_fail "Stop service $name:$version"
+		return 1
+	fi
+	
+	appdeploy_step_ok "Service stopped"
+	appdeploy_program_ok "Stop service $name:$version"
+	return 0
+}
+
+# Function: appdeploy_service_restart TARGET PACKAGE[:VERSION]
+# Restarts the service (stop + start)
+function appdeploy_service_restart() {
+	local target="$1"
+	local spec="$2"
+	local name version
+	read -r name version <<< "$(appdeploy_package_parse "$spec")"
+	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	# Resolve version
+	version=$(appdeploy_service_resolve_version "$target" "$name" "$version")
+	if [[ -z "$version" ]]; then
+		appdeploy_error "No version found for $name on $target"
+		return 1
+	fi
+	
+	appdeploy_program "Restart service $name:$version"
+	
+	# Stop (ignore errors - might not be running)
+	appdeploy_step "Stopping service"
+	appdeploy_service_stop "$target" "$name:$version" 2>/dev/null || true
+	
+	# Brief pause
+	sleep 2
+	
+	# Start
+	appdeploy_step "Starting service"
+	if ! appdeploy_service_start "$target" "$name:$version"; then
+		appdeploy_step_fail "Failed to start service"
+		appdeploy_program_fail "Restart service $name:$version"
+		return 1
+	fi
+	
+	appdeploy_program_ok "Restart service $name:$version"
+	return 0
+}
+
+# Function: appdeploy_service_status TARGET PACKAGE[:VERSION]
+# Shows the service status (running/stopped/inactive)
+function appdeploy_service_status() {
+	local target="$1"
+	local spec="$2"
+	local name version
+	read -r name version <<< "$(appdeploy_package_parse "$spec")"
+	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_name
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	
+	# Check if package directory exists
+	if ! appdeploy_cmd_run "$target" "test -d '${escaped_path}/${escaped_name}'" 2>/dev/null; then
+		appdeploy_info "Package $name not found on $target"
+		return 1
+	fi
+	
+	# Get active version
+	local active
+	active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_name}/.active' 2>/dev/null" || true)
+	
+	if [[ -z "$active" ]]; then
+		printf '%s%s%s: %sinactive%s (not activated)\n' "$BOLD" "$name" "$RESET" "$YELLOW" "$RESET"
+		return 0
+	fi
+	
+	# If specific version requested, check it matches
+	if [[ -n "$version" && "$version" != "$active" ]]; then
+		printf '%s%s:%s%s: %sinactive%s (active version is %s)\n' "$BOLD" "$name" "$version" "$RESET" "$YELLOW" "$RESET" "$active"
+		return 0
+	fi
+	
+	# Check if runner exists and get status
+	if ! appdeploy_cmd_run "$target" "test -x '${escaped_path}/appdeploy.runner.sh'" 2>/dev/null; then
+		printf '%s%s:%s%s: %sstopped%s (runner not deployed)\n' "$BOLD" "$name" "$active" "$RESET" "$YELLOW" "$RESET"
+		return 0
+	fi
+	
+	# Invoke runner status
+	local status_output
+	status_output=$(appdeploy_runner_invoke "$target" "$name" "status" 2>&1) || true
+	
+	# Parse status output to determine if running
+	if echo "$status_output" | grep -qiE '(running|active)'; then
+		printf '%s%s:%s%s: %srunning%s\n' "$BOLD" "$name" "$active" "$RESET" "$GREEN" "$RESET"
+	else
+		printf '%s%s:%s%s: %sstopped%s\n' "$BOLD" "$name" "$active" "$RESET" "$YELLOW" "$RESET"
+	fi
+	
+	return 0
+}
+
+# Function: appdeploy_service_logs TARGET PACKAGE[:VERSION] [OPTIONS]
+# Shows service logs (-f to follow)
+function appdeploy_service_logs() {
+	local target="$1"
+	local spec="$2"
+	shift 2
+	local follow=""
+	
+	# Parse options
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-f|--follow)
+				follow="-f"
+				shift
+				;;
+			*)
+				appdeploy_warn "Unknown option: $1"
+				shift
+				;;
+		esac
+	done
+	
+	local name version
+	read -r name version <<< "$(appdeploy_package_parse "$spec")"
+	
+	# Validate name
+	if ! appdeploy_validate_name "$name"; then
+		return 1
+	fi
+	
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path escaped_name
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	escaped_name=$(appdeploy_escape_single_quotes "$name")
+	
+	# Check if runner exists
+	if ! appdeploy_cmd_run "$target" "test -x '${escaped_path}/appdeploy.runner.sh'" 2>/dev/null; then
+		appdeploy_warn "Runner not deployed, trying direct log access"
+		# Fall back to direct log file access
+		local log_dir="$path/$name/var/logs"
+		local escaped_log_dir
+		escaped_log_dir=$(appdeploy_escape_single_quotes "$log_dir")
+		
+		if [[ -n "$follow" ]]; then
+			appdeploy_cmd_run "$target" "tail -f '${escaped_log_dir}/current.log' 2>/dev/null || tail -f \$(ls -t '${escaped_log_dir}'/*.log 2>/dev/null | head -1)"
+		else
+			appdeploy_cmd_run "$target" "tail -50 '${escaped_log_dir}/current.log' 2>/dev/null || tail -50 \$(ls -t '${escaped_log_dir}'/*.log 2>/dev/null | head -1)"
+		fi
+		return $?
+	fi
+	
+	# Invoke runner logs
+	appdeploy_runner_invoke "$target" "$name" "logs" "$follow"
+}
+
+# ----------------------------------------------------------------------------
+#
 # HELP SYSTEM
 #
 # ----------------------------------------------------------------------------
@@ -1866,6 +2372,13 @@ function appdeploy_show_help() {
 	printf "  %-20s %s\n" "remove" "Remove package completely"
 	printf "  %-20s %s\n" "list" "List packages on target"
 	printf "  %-20s %s\n" "configure" "Deploy configuration to package"
+	echo ""
+	echo "${BOLD}Service Management:${RESET}"
+	printf "  %-20s %s\n" "start" "Start service daemon"
+	printf "  %-20s %s\n" "stop" "Stop service daemon"
+	printf "  %-20s %s\n" "restart" "Restart service daemon"
+	printf "  %-20s %s\n" "status" "Show service status"
+	printf "  %-20s %s\n" "logs" "Show/follow service logs"
 	echo ""
 	echo "${BOLD}Use 'appdeploy COMMAND --help' for more information on a specific command.${RESET}"
 	
@@ -2353,6 +2866,96 @@ function appdeploy_configure() {
 	appdeploy_package_deploy_conf "$target" "$spec" "$conf_archive"
 }
 
+# Function: appdeploy_start PACKAGE[:VERSION] [TARGET]
+# Start service daemon (auto-activates if needed)
+function appdeploy_start() {
+	if [[ $# -lt 1 ]]; then
+		appdeploy_error "Usage: appdeploy start PACKAGE[:VERSION] [TARGET]"
+		return 1
+	fi
+	
+	local spec="$1"
+	local target="${2:-$(appdeploy_default_target)}"
+	
+	appdeploy_service_start "$target" "$spec"
+}
+
+# Function: appdeploy_stop PACKAGE[:VERSION] [TARGET]
+# Stop service daemon
+function appdeploy_stop() {
+	if [[ $# -lt 1 ]]; then
+		appdeploy_error "Usage: appdeploy stop PACKAGE[:VERSION] [TARGET]"
+		return 1
+	fi
+	
+	local spec="$1"
+	local target="${2:-$(appdeploy_default_target)}"
+	
+	appdeploy_service_stop "$target" "$spec"
+}
+
+# Function: appdeploy_restart PACKAGE[:VERSION] [TARGET]
+# Restart service daemon
+function appdeploy_restart() {
+	if [[ $# -lt 1 ]]; then
+		appdeploy_error "Usage: appdeploy restart PACKAGE[:VERSION] [TARGET]"
+		return 1
+	fi
+	
+	local spec="$1"
+	local target="${2:-$(appdeploy_default_target)}"
+	
+	appdeploy_service_restart "$target" "$spec"
+}
+
+# Function: appdeploy_status PACKAGE[:VERSION] [TARGET]
+# Show service status
+function appdeploy_status() {
+	if [[ $# -lt 1 ]]; then
+		appdeploy_error "Usage: appdeploy status PACKAGE[:VERSION] [TARGET]"
+		return 1
+	fi
+	
+	local spec="$1"
+	local target="${2:-$(appdeploy_default_target)}"
+	
+	appdeploy_service_status "$target" "$spec"
+}
+
+# Function: appdeploy_logs PACKAGE[:VERSION] [TARGET] [-f]
+# Show service logs
+function appdeploy_logs() {
+	if [[ $# -lt 1 ]]; then
+		appdeploy_error "Usage: appdeploy logs PACKAGE[:VERSION] [TARGET] [-f]"
+		return 1
+	fi
+	
+	local spec="$1"
+	shift
+	local target=""
+	local follow_args=()
+	
+	# Parse remaining arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-f|--follow)
+				follow_args+=("-f")
+				shift
+				;;
+			*)
+				if [[ -z "$target" ]]; then
+					target="$1"
+				fi
+				shift
+				;;
+		esac
+	done
+	
+	[[ -z "$target" ]] && target="$(appdeploy_default_target)"
+	
+	appdeploy_service_logs "$target" "$spec" "${follow_args[@]}"
+}
+
 # ----------------------------------------------------------------------------
 #
 # HELP SYSTEM
@@ -2574,6 +3177,117 @@ function appdeploy_help_configure() {
 	echo "  appdeploy configure myapp:1.0.0 config.tar.gz user@host:/opt/apps"
 }
 
+# Function: appdeploy_help_start
+# Shows help for the 'start' command
+function appdeploy_help_start() {
+	echo "${BOLD}appdeploy start - Start service daemon${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy start PACKAGE[:VERSION] [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Version (default: active or latest)"
+	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	echo ""
+	echo "${BOLD}Description:${RESET}"
+	echo "  Starts the service daemon. Auto-activates if package is not active."
+	echo "  Version resolution: active > last-active > latest"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy start myapp"
+	echo "  appdeploy start myapp:1.0.0"
+	echo "  appdeploy start myapp user@host:/opt/apps"
+}
+
+# Function: appdeploy_help_stop
+# Shows help for the 'stop' command
+function appdeploy_help_stop() {
+	echo "${BOLD}appdeploy stop - Stop service daemon${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy stop PACKAGE[:VERSION] [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version"
+	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	echo ""
+	echo "${BOLD}Description:${RESET}"
+	echo "  Stops the service daemon gracefully."
+	echo "  Does NOT deactivate the package (symlinks remain)."
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy stop myapp"
+	echo "  appdeploy stop myapp:1.0.0 user@host:/opt/apps"
+}
+
+# Function: appdeploy_help_restart
+# Shows help for the 'restart' command
+function appdeploy_help_restart() {
+	echo "${BOLD}appdeploy restart - Restart service daemon${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy restart PACKAGE[:VERSION] [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version (default: active)"
+	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	echo ""
+	echo "${BOLD}Description:${RESET}"
+	echo "  Restarts the service (equivalent to stop + start)."
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy restart myapp"
+	echo "  appdeploy restart myapp user@host:/opt/apps"
+}
+
+# Function: appdeploy_help_status
+# Shows help for the 'status' command
+function appdeploy_help_status() {
+	echo "${BOLD}appdeploy status - Show service status${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy status PACKAGE[:VERSION] [TARGET]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version"
+	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	echo ""
+	echo "${BOLD}Status Values:${RESET}"
+	printf "  %-20s %s\n" "running" "Service is active and running (green)"
+	printf "  %-20s %s\n" "stopped" "Package activated but service not running"
+	printf "  %-20s %s\n" "inactive" "Package exists but not activated"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy status myapp"
+	echo "  appdeploy status myapp:1.0.0 user@host:/opt/apps"
+}
+
+# Function: appdeploy_help_logs
+# Shows help for the 'logs' command
+function appdeploy_help_logs() {
+	echo "${BOLD}appdeploy logs - Show service logs${RESET}"
+	echo ""
+	echo "${BOLD}Usage:${RESET}"
+	echo "  appdeploy logs PACKAGE[:VERSION] [TARGET] [-f]"
+	echo ""
+	echo "${BOLD}Arguments:${RESET}"
+	printf "  %-20s %s\n" "PACKAGE" "Package name"
+	printf "  %-20s %s\n" "VERSION" "Optional version"
+	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	echo ""
+	echo "${BOLD}Options:${RESET}"
+	printf "  %-20s %s\n" "-f, --follow" "Follow logs in real-time (like tail -f)"
+	echo ""
+	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy logs myapp"
+	echo "  appdeploy logs myapp -f"
+	echo "  appdeploy logs myapp user@host:/opt/apps -f"
+}
+
 # Function: appdeploy_help_prepare
 # Shows help for the 'prepare' command
 function appdeploy_help_prepare() {
@@ -2729,13 +3443,28 @@ function appdeploy_cli() {
 			remove)
 				appdeploy_help_remove
 				;;
-			list)
-				appdeploy_help_list
-				;;
-			configure)
-				appdeploy_help_configure
-				;;
-			*)
+		list)
+			appdeploy_help_list
+			;;
+		configure)
+			appdeploy_help_configure
+			;;
+		start)
+			appdeploy_help_start
+			;;
+		stop)
+			appdeploy_help_stop
+			;;
+		restart)
+			appdeploy_help_restart
+			;;
+		status)
+			appdeploy_help_status
+			;;
+		logs)
+			appdeploy_help_logs
+			;;
+		*)
 				appdeploy_error "Unknown command: $help_target"
 				appdeploy_error "Use 'appdeploy --help' for usage information"
 				return 1
@@ -2792,6 +3521,21 @@ function appdeploy_cli() {
 		;;
 		configure)
 			appdeploy_configure "$@"
+		;;
+		start)
+			appdeploy_start "$@"
+		;;
+		stop)
+			appdeploy_stop "$@"
+		;;
+		restart)
+			appdeploy_restart "$@"
+		;;
+		status)
+			appdeploy_status "$@"
+		;;
+		logs)
+			appdeploy_logs "$@"
 		;;
 		--help|-h|help)
 			appdeploy_show_help "true"

@@ -16,28 +16,14 @@ _appdeploy_complete() {
 	cur="${COMP_WORDS[COMP_CWORD]}"
 	prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-	# Define the main commands and subcommands
-	local commands="package target run"
-	local package_subcommands="create upload install activate deactivate uninstall remove list deploy-conf"
-	local target_subcommands="install check"
+	# Define the main commands
+	local commands="run package deploy prepare check upload install activate deactivate uninstall remove list configure"
 
 	# Case statement to handle completion based on the current context
 	case "$prev" in
 	appdeploy)
 		# Complete main commands
 		readarray -t COMPREPLY < <(compgen -W "$commands" -- "$cur")
-		;;
-	package)
-		# Complete package subcommands
-		readarray -t COMPREPLY < <(compgen -W "$package_subcommands" -- "$cur")
-		;;
-	target)
-		# Complete target subcommands
-		readarray -t COMPREPLY < <(compgen -W "$target_subcommands" -- "$cur")
-		;;
-	run)
-		# Complete run subcommands (if any)
-		COMPREPLY=()
 		;;
 	*)
 		# Default completion (e.g., file paths)

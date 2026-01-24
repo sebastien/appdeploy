@@ -30,11 +30,11 @@ LOG_COUNT="${LOG_COUNT:-7}" # Keep 7 rotated logs
 RUN_USER="${RUN_USER:-$(whoami)}"
 USE_SYSTEMD="${USE_SYSTEMD:-auto}" # auto, true, false
 
-# Paths
+# Paths (can be overridden via environment variables)
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SYSTEM_SYSTEMD_DIR="/etc/systemd/system"
-LOG_DIR="/var/log/$APP_NAME"
-PID_FILE="/tmp/${APP_NAME}.pid"
+LOG_DIR="${LOG_DIR:-/var/log/$APP_NAME}"
+PID_FILE="${PID_FILE:-/tmp/${APP_NAME}.pid}"
 
 # --
 # ## Color library
