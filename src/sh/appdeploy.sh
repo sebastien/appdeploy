@@ -328,7 +328,7 @@ function appdeploy_runner_invoke() {
 	escaped_path=$(appdeploy_escape_single_quotes "$path")
 	escaped_package=$(appdeploy_escape_single_quotes "$package")
 	
-	# Build environment variables for runner
+ 	# Build environment variables for runner
 	local env_vars="APP_NAME='${escaped_package}'"
 	env_vars+=" APP_SCRIPT='${escaped_path}/${escaped_package}/run/run.sh'"
 	env_vars+=" APP_ENV_SCRIPT='${escaped_path}/${escaped_package}/run/env.sh'"
@@ -336,6 +336,9 @@ function appdeploy_runner_invoke() {
 	env_vars+=" APP_PID_FILE='${escaped_path}/${escaped_package}/.pid'"
 	[[ -n "$user" ]] && env_vars+=" APP_RUN_USER='${user}'"
 	env_vars+=" APP_USE_SYSTEMD=auto"
+	
+	# Add expected runner version for compatibility checking
+	env_vars+=" APPDEPLOY_RUNNER_EXPECTED_VERSION='${APPDEPLOY_VERSION}'"
 	
 	# Invoke runner (use export to ensure variables are available in all shell environments)
 	local runner_cmd="export ${env_vars}; '${escaped_path}/appdeploy.runner.sh' ${cmd} ${args}"

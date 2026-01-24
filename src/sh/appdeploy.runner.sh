@@ -32,6 +32,9 @@ APP_LOG_COUNT="${APP_LOG_COUNT:-7}" # Keep 7 rotated logs
 APP_RUN_USER="${APP_RUN_USER:-$(whoami)}"
 APP_USE_SYSTEMD="${APP_USE_SYSTEMD:-auto}" # auto, true, false
 
+# Runner version - used for compatibility checking
+APPDEPLOY_RUNNER_VERSION="${APPDEPLOY_RUNNER_VERSION:-1.0.0}"
+
 # Paths (can be overridden via environment variables)
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SYSTEM_SYSTEMD_DIR="/etc/systemd/system"
@@ -97,6 +100,65 @@ appdeploy_runner_debug() {
 	if [ -n "${DEBUG:-}" ]; then
 		local prefix="[debug] _._"
 		printf '%s%s %s%s\n' "$GRAY" "$prefix" "$*" "$RESET"
+	fi
+}
+
+# Function: appdeploy_runner_get_version
+# Extracts the version from the current runner script
+# Returns the version string
+appdeploy_runner_get_version() {
+	# Since the version is set as a variable, we can just echo the variable value
+	# The variable is already set at the top of the script
+	echo "${APPDEPLOY_RUNNER_VERSION:-1.0.0}"
+}
+
+# Function: appdeploy_runner_compare_versions VERSION1 VERSION2
+# Compares two semantic version strings
+# Returns 0 if versions match, 1 if they don't
+appdeploy_runner_compare_versions() {
+	local version1="$1"
+	local version2="$2"
+	
+	# If versions are identical, return success
+	if [ "$version1" = "$version2" ]; then
+		return 0
+	fi
+	
+	# If either version is empty, consider them different
+	if [ -z "$version1" ] || [ -z "$version2" ]; then
+		return 1
+	fi
+	
+	# For semantic versioning, we could add more sophisticated comparison
+	# But for now, simple string comparison is sufficient for our needs
+	return 1
+}
+
+# Function: appdeploy_runner_check_version EXPECTED_VERSION
+# Checks if the current runner version matches the expected version
+# If not, outputs warning and exits
+# Returns 0 if version is acceptable, exits with error if not
+appdeploy_runner_check_version() {
+	local expected_version="$1"
+	
+	# If no expected version is specified, skip the check (backward compatibility)
+	if [ -z "$expected_version" ]; then
+		appdeploy_runner_debug "No expected version specified, skipping version check"
+		return 0
+	fi
+	
+	local current_version
+	current_version=$(appdeploy_runner_get_version)
+	
+	appdeploy_runner_debug "Checking runner version: current=$current_version, expected=$expected_version"
+	
+	if appdeploy_runner_compare_versions "$current_version" "$expected_version"; then
+		appdeploy_runner_debug "Version check passed: runner version $current_version matches expected $expected_version"
+		return 0
+	else
+		appdeploy_runner_error "Version mismatch: runner is version $current_version but expected $expected_version"
+		appdeploy_runner_error "Please update the runner script before proceeding"
+		return 1
 	fi
 }
 
@@ -759,6 +821,12 @@ EOF
 # Function: appdeploy_runner_install_service
 # Main entry point for installing the service
 appdeploy_runner_install_service() {
+	# Check version compatibility before proceeding
+	if ! appdeploy_runner_check_version "${APPDEPLOY_RUNNER_EXPECTED_VERSION:-}"; then
+		appdeploy_runner_error "Cannot proceed with installation due to version mismatch"
+		return 1
+	fi
+	
 	appdeploy_runner_comprehensive_dependency_check "install"
 
 	if [ "$APP_USE_SYSTEMD" = "true" ]; then
@@ -777,6 +845,12 @@ appdeploy_runner_install_service() {
 # Function: appdeploy_runner_start_service
 # Starts the service (systemd or manual daemon)
 appdeploy_runner_start_service() {
+	# Check version compatibility before proceeding
+	if ! appdeploy_runner_check_version "${APPDEPLOY_RUNNER_EXPECTED_VERSION:-}"; then
+		appdeploy_runner_error "Cannot proceed with start due to version mismatch"
+		return 1
+	fi
+	
 	appdeploy_runner_comprehensive_dependency_check
 
 	if [ "$APP_USE_SYSTEMD" = "true" ]; then
@@ -798,6 +872,11 @@ appdeploy_runner_start_service() {
 # Function: appdeploy_runner_stop_service
 # Stops the service (systemd or manual daemon)
 appdeploy_runner_stop_service() {
+	# Check version compatibility before proceeding
+	if ! appdeploy_runner_check_version "${APPDEPLOY_RUNNER_EXPECTED_VERSION:-}"; then
+		appdeploy_runner_error "Cannot proceed with stop due to version mismatch"
+		return 1
+	fi
 	if [ "$APP_USE_SYSTEMD" = "true" ]; then
 		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			systemctl stop "${APP_NAME}.service"
@@ -962,8 +1041,10 @@ appdeploy_runner_check_dependencies() {
 # Function: appdeploy_runner_show_help
 # Displays usage information
 appdeploy_runner_show_help() {
+	local current_version
+	current_version=$(appdeploy_runner_get_version)
+	echo "AppDeploy Runner - Daemon Manager for $APP_NAME (version $current_version)"
 	cat <<EOF
-AppDeploy Runner - Daemon Manager for $APP_NAME
 
 Usage: $0 [COMMAND] [OPTIONS]
 
@@ -990,26 +1071,6 @@ Environment Variables:
     APP_RUN_USER     User to run service as (default: current user)
     APP_USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
 
-Dependency Check:
-    The script automatically checks for:
-    + Basic shell tools (required)
-    + systemd availability (preferred)
-    + rotatelogs availability (preferred)
-    + Package manager detection
-    + Permission validation
-
-Installation Commands by Distro:
-    Ubuntu/Debian: sudo apt-get install apache2-utils
-    Fedora/RHEL:   sudo dnf install httpd-tools
-    CentOS:        sudo yum install httpd-tools
-    Arch:          sudo pacman -S apache
-    openSUSE:      sudo zypper install apache2-utils
-
-Features:
-    - Comprehensive dependency checking before any operation
-    - Automatic fallback to compatible alternatives
-    - Interactive installation of optional dependencies
-    - Clear status reporting and recommendations
 EOF
 }
 
@@ -1035,6 +1096,11 @@ stop)
 	appdeploy_runner_stop_service
 	;;
 restart)
+	# Check version compatibility before proceeding
+	if ! appdeploy_runner_check_version "${APPDEPLOY_RUNNER_EXPECTED_VERSION:-}"; then
+		appdeploy_runner_error "Cannot proceed with restart due to version mismatch"
+		return 1
+	fi
 	appdeploy_runner_stop_service
 	sleep 2
 	appdeploy_runner_start_service
