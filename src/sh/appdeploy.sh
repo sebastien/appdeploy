@@ -191,6 +191,34 @@ function appdeploy_runner_path() {
 	printf '%s/appdeploy.runner.sh' "$(dirname "$script_path")"
 }
 
+# Function: appdeploy_runner_hash_local
+# Returns hash of local runner script
+function appdeploy_runner_hash_local() {
+	local runner_src
+	runner_src=$(appdeploy_runner_path)
+	
+	if [[ ! -f "$runner_src" ]]; then
+		return 1
+	fi
+	
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$runner_src" | cut -d ' ' -f1
+	else
+		cksum "$runner_src" | cut -d ' ' -f1
+	fi
+}
+
+# Function: appdeploy_runner_hash_remote TARGET RUNNER_PATH
+# Returns hash of remote runner script (or empty if unavailable)
+function appdeploy_runner_hash_remote() {
+	local target="$1"
+	local runner_dest="$2"
+	local escaped_dest
+	escaped_dest=$(appdeploy_escape_single_quotes "$runner_dest")
+	
+	appdeploy_cmd_run "$target" "if command -v sha256sum >/dev/null 2>&1; then sha256sum '${escaped_dest}' 2>/dev/null | cut -d ' ' -f1; elif command -v cksum >/dev/null 2>&1; then cksum '${escaped_dest}' 2>/dev/null | cut -d ' ' -f1; else echo missing; fi" || true
+}
+
 # Function: appdeploy_runner_deploy TARGET
 # Deploys the runner script to $TARGET_PATH/appdeploy.runner.sh
 function appdeploy_runner_deploy() {
@@ -253,10 +281,23 @@ function appdeploy_runner_ensure() {
 	local escaped_dest
 	escaped_dest=$(appdeploy_escape_single_quotes "$runner_dest")
 	
+	local local_hash
+	local_hash=$(appdeploy_runner_hash_local) || true
+	
 	# Check if runner exists on target
 	if ! appdeploy_cmd_run "$target" "test -x '${escaped_dest}'" 2>/dev/null; then
 		appdeploy_log "Deploying runner script to target"
-		appdeploy_runner_deploy "$target"
+		appdeploy_runner_deploy "$target" || return 1
+		return 0
+	fi
+	
+	if [[ -n "$local_hash" ]]; then
+		local remote_hash
+		remote_hash=$(appdeploy_runner_hash_remote "$target" "$runner_dest")
+		if [[ -z "$remote_hash" || "$remote_hash" == "missing" || "$remote_hash" != "$local_hash" ]]; then
+			appdeploy_log "Updating runner script on target"
+			appdeploy_runner_deploy "$target" || return 1
+		fi
 	fi
 }
 
@@ -280,6 +321,9 @@ function appdeploy_runner_invoke() {
 		return 1
 	fi
 	
+	# Ensure runner is up to date
+	appdeploy_runner_ensure "$target" || true
+	
 	local escaped_path escaped_package
 	escaped_path=$(appdeploy_escape_single_quotes "$path")
 	escaped_package=$(appdeploy_escape_single_quotes "$package")
@@ -293,8 +337,10 @@ function appdeploy_runner_invoke() {
 	[[ -n "$user" ]] && env_vars+=" APP_RUN_USER='${user}'"
 	env_vars+=" APP_USE_SYSTEMD=auto"
 	
-	# Invoke runner
-	appdeploy_cmd_run "$target" "${env_vars} '${escaped_path}/appdeploy.runner.sh' ${cmd} ${args}"
+	# Invoke runner (use export to ensure variables are available in all shell environments)
+	local runner_cmd="export ${env_vars}; '${escaped_path}/appdeploy.runner.sh' ${cmd} ${args}"
+	[[ -n "${DEBUG:-}" ]] && appdeploy_debug "Runner command: ${runner_cmd}"
+	appdeploy_cmd_run "$target" "$runner_cmd"
 }
 
 # ============================================================================
@@ -603,7 +649,9 @@ function appdeploy_cmd_run() {
 	else
 		# Run via SSH with proper escaping
 		# Use -- to prevent option injection, escape the command properly
-		local ssh_cmd="cd '${escaped_path}' && ${cmd}"
+		local escaped_cmd
+		escaped_cmd=$(appdeploy_escape_single_quotes "$cmd")
+		local ssh_cmd="cd '${escaped_path}' && bash -lc '${escaped_cmd}'"
 		if ! out=$(ssh -o BatchMode=yes -- "${user}@${host}" "$ssh_cmd" 2>&1); then
 			return 1
 		fi
@@ -1185,6 +1233,94 @@ function appdeploy_package_current() {
 	return 0
 }
 
+# Function: appdeploy_service_runtime_info TARGET PACKAGE
+# Returns "yes|pid|runtime" (runtime in seconds) or "no|-|-"
+function appdeploy_service_runtime_info() {
+	local target="$1"
+	local name="$2"
+	local run_user
+	run_user=$(appdeploy_target_user "$target")
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		printf 'no|-|-\n'
+		return 1
+	fi
+	
+	local systemctl_cmd="systemctl"
+	if [[ -n "$run_user" && "$run_user" != "root" ]]; then
+		systemctl_cmd="systemctl --user"
+	fi
+	
+	local is_active
+	is_active=$(appdeploy_cmd_run "$target" "command -v systemctl >/dev/null 2>&1 && ${systemctl_cmd} is-active --quiet '${name}.service' && echo yes || echo no" || true)
+	if [[ "$is_active" == "yes" ]]; then
+		local main_pid
+		main_pid=$(appdeploy_cmd_run "$target" "${systemctl_cmd} show -p MainPID --value '${name}.service' 2>/dev/null" || true)
+		if [[ -n "$main_pid" && "$main_pid" =~ ^[0-9]+$ ]] && [[ "$main_pid" != "0" ]] && appdeploy_cmd_run "$target" "kill -0 ${main_pid} 2>/dev/null"; then
+			local runtime
+			runtime=$(appdeploy_cmd_run "$target" "ps -p ${main_pid} -o etimes= 2>/dev/null | tr -d ' '" || true)
+			[[ -z "$runtime" ]] && runtime="-"
+			printf 'yes|%s|%s\n' "$main_pid" "$runtime"
+			return 0
+		fi
+		printf 'yes|0|-\n'
+		return 0
+	fi
+	
+	local pid_file="$path/$name/.pid"
+	local escaped_pid_file
+	escaped_pid_file=$(appdeploy_escape_single_quotes "$pid_file")
+	
+	local pid
+	pid=$(appdeploy_cmd_run "$target" "cat '${escaped_pid_file}' 2>/dev/null" || true)
+	
+	if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] && appdeploy_cmd_run "$target" "kill -0 ${pid} 2>/dev/null"; then
+		local runtime
+		runtime=$(appdeploy_cmd_run "$target" "ps -p ${pid} -o etimes= 2>/dev/null | tr -d ' '" || true)
+		[[ -z "$runtime" ]] && runtime="-"
+		printf 'yes|%s|%s\n' "$pid" "$runtime"
+	else
+		printf 'no|-|-\n'
+	fi
+}
+
+# Function: appdeploy_format_runtime SECONDS
+# Formats seconds as compact duration (e.g., 1d2h3m4s)
+function appdeploy_format_runtime() {
+	local seconds="$1"
+	if [[ -z "$seconds" || "$seconds" == "-" ]]; then
+		printf '%s' "-"
+		return 0
+	fi
+	if [[ ! "$seconds" =~ ^[0-9]+$ ]]; then
+		printf '%s' "$seconds"
+		return 0
+	fi
+	
+	local days=$((seconds / 86400))
+	local hours=$(( (seconds % 86400) / 3600 ))
+	local mins=$(( (seconds % 3600) / 60 ))
+	local secs=$(( seconds % 60 ))
+	local out=""
+	
+	if (( days > 0 )); then
+		out+="${days}d"
+	fi
+	if (( hours > 0 )); then
+		out+="${hours}h"
+	fi
+	if (( mins > 0 )); then
+		out+="${mins}m"
+	fi
+	if (( secs > 0 || seconds == 0 )); then
+		out+="${secs}s"
+	fi
+	
+	printf '%s' "$out"
+}
+
 # supporting wildcards. 
 function appdeploy_package_list() {
 	local target="$1"
@@ -1223,12 +1359,16 @@ function appdeploy_package_list() {
 		return 0
 	fi
 	
-	printf "%-20s %-15s %-10s %-10s\n" "PACKAGE" "VERSION" "STATUS" "LOCATION"
-	printf "%-20s %-15s %-10s %-10s\n" "-------" "-------" "------" "--------"
-	
 	for app in $apps; do
 		# Validate app name from filesystem to prevent injection
 		if ! appdeploy_validate_name "$app" 2>/dev/null; then
+			continue
+		fi
+		
+		local app_dir="$path/$app"
+		local escaped_app_dir
+		escaped_app_dir=$(appdeploy_escape_single_quotes "$app_dir")
+		if ! appdeploy_cmd_run "$target" "test -d '${escaped_app_dir}'" 2>/dev/null; then
 			continue
 		fi
 		
@@ -1254,11 +1394,11 @@ function appdeploy_package_list() {
 		
 		# List uploaded packages
 			local pkg_versions
-			pkg_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_app}-[0-9].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_app}-//;s/\\.tar\\.(gz|bz2|xz)\$//' || true")
+			pkg_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_pkg_dir}' 2>/dev/null | grep -E '^${escaped_app}-[0-9a-zA-Z].*\\.tar\\.(gz|bz2|xz)\$' | sed -E 's/^${escaped_app}-//;s/\\.tar\\.(gz|bz2|xz)\$//' || true")
 		
 		# List installed versions
 			local installed_versions
-			installed_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9]' || true")
+			installed_versions=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_dist_dir}' 2>/dev/null | grep -E '^[0-9a-zA-Z]' || true")
 		
 		# Combine and deduplicate versions
 		local all_versions
@@ -1268,44 +1408,34 @@ function appdeploy_package_list() {
 			continue
 		fi
 		
+		if [[ -n "$version" ]]; then
+			local version_found=""
 			for v in $all_versions; do
-			# Validate version from filesystem
-			if ! appdeploy_validate_version "$v" 2>/dev/null; then
-				continue
-			fi
-			
-			# Filter by version if specified
-				if [[ -n "$version" && "$v" != "$version" ]]; then
-				continue
-			fi
-			
-			local status=""
-			local location=""
-			
-			# Check if uploaded
-			if echo "$pkg_versions" | grep -q "^${v}$"; then
-				location="packages"
-			fi
-			
-			# Check if installed
-			if echo "$installed_versions" | grep -q "^${v}$"; then
-				if [[ -n "$location" ]]; then
-					location="both"
-				else
-					location="dist"
+				if [[ "$v" == "$version" ]]; then
+					version_found="yes"
+					break
 				fi
-				status="installed"
+			done
+			if [[ -z "$version_found" ]]; then
+				continue
+			fi
+		fi
+		
+		local versions_list
+		versions_list=$(printf '%s\n' "$all_versions" | paste -sd, -)
+		
+		local display_version="-"
+		if [[ -n "$active_version" ]]; then
+			local runtime_info
+			runtime_info=$(appdeploy_service_runtime_info "$target" "$app")
+			if [[ "${runtime_info%%|*}" == "yes" ]]; then
+				display_version="${GREEN}${active_version}${RESET}"
 			else
-				status="uploaded"
+				display_version="${BLUE}${active_version}${RESET}"
 			fi
-			
-			# Check if active
-			if [[ "$v" == "$active_version" ]]; then
-				status="active"
-			fi
-			
-			printf "%-20s %-15s %-10s %-10s\n" "$app" "$v" "$status" "$location"
-		done
+		fi
+		
+		printf "%-20s %-20s %s\n" "$app" "$display_version" "$versions_list"
 	done
 }
 
@@ -2167,6 +2297,8 @@ function appdeploy_service_stop() {
 	escaped_path=$(appdeploy_escape_single_quotes "$path")
 	escaped_name=$(appdeploy_escape_single_quotes "$name")
 	
+	appdeploy_runner_ensure "$target" || true
+	
 	# Check if runner exists
 	if ! appdeploy_cmd_run "$target" "test -x '${escaped_path}/appdeploy.runner.sh'" 2>/dev/null; then
 		appdeploy_info "Runner not deployed, service likely not running"
@@ -2233,6 +2365,12 @@ function appdeploy_service_restart() {
 function appdeploy_service_status() {
 	local target="$1"
 	local spec="$2"
+	
+	if [[ -z "$spec" ]]; then
+		appdeploy_service_status_overview "$target"
+		return $?
+	fi
+	
 	local name version
 	read -r name version <<< "$(appdeploy_package_parse "$spec")"
 	
@@ -2258,39 +2396,115 @@ function appdeploy_service_status() {
 		return 1
 	fi
 	
-	# Get active version
+	local package_path="$path/$name"
 	local active
 	active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_name}/.active' 2>/dev/null" || true)
 	
-	if [[ -z "$active" ]]; then
-		printf '%s%s%s: %sinactive%s (not activated)\n' "$BOLD" "$name" "$RESET" "$YELLOW" "$RESET"
-		return 0
+	local version_display="-"
+	local status="inactive"
+	local active_flag="no"
+	local running="no"
+	local runtime="-"
+	local pid="-"
+	
+	if [[ -n "$version" && -z "$active" ]]; then
+		version_display="$version"
 	fi
 	
-	# If specific version requested, check it matches
-	if [[ -n "$version" && "$version" != "$active" ]]; then
-		printf '%s%s:%s%s: %sinactive%s (active version is %s)\n' "$BOLD" "$name" "$version" "$RESET" "$YELLOW" "$RESET" "$active"
-		return 0
+	if [[ -n "$active" ]]; then
+		if [[ -z "$version" || "$version" == "$active" ]]; then
+			version_display="$active"
+			active_flag="yes"
+			local runtime_info
+			runtime_info=$(appdeploy_service_runtime_info "$target" "$name")
+			running="${runtime_info%%|*}"
+			pid="${runtime_info#*|}"
+			pid="${pid%%|*}"
+			runtime="${runtime_info##*|}"
+			if [[ "$running" == "yes" ]]; then
+				status="running"
+			else
+				status="stopped"
+			fi
+		else
+			version_display="$version"
+			status="inactive"
+		fi
 	fi
 	
-	# Check if runner exists and get status
-	if ! appdeploy_cmd_run "$target" "test -x '${escaped_path}/appdeploy.runner.sh'" 2>/dev/null; then
-		printf '%s%s:%s%s: %sstopped%s (runner not deployed)\n' "$BOLD" "$name" "$active" "$RESET" "$YELLOW" "$RESET"
-		return 0
-	fi
+	runtime=$(appdeploy_format_runtime "$runtime")
 	
-	# Invoke runner status
-	local status_output
-	status_output=$(appdeploy_runner_invoke "$target" "$name" "status" 2>&1) || true
-	
-	# Parse status output to determine if running
-	if echo "$status_output" | grep -qiE '(running|active)'; then
-		printf '%s%s:%s%s: %srunning%s\n' "$BOLD" "$name" "$active" "$RESET" "$GREEN" "$RESET"
-	else
-		printf '%s%s:%s%s: %sstopped%s\n' "$BOLD" "$name" "$active" "$RESET" "$YELLOW" "$RESET"
-	fi
+	printf "%-20s %-15s %-10s %-30s %-7s %-7s %-8s %s\n" "$name" "$version_display" "$status" "$package_path" "$active_flag" "$running" "$runtime" "$pid"
 	
 	return 0
+}
+
+# Function: appdeploy_service_status_overview TARGET
+# Shows status for all packages on target
+function appdeploy_service_status_overview() {
+	local target="$1"
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
+	local apps
+	apps=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_path}' 2>/dev/null | grep -v '^\\.' || true")
+	
+	if [[ -z "$apps" ]]; then
+		appdeploy_log "No packages found on $target"
+		return 0
+	fi
+	
+	for app in $apps; do
+		if ! appdeploy_validate_name "$app" 2>/dev/null; then
+			continue
+		fi
+		
+		local app_dir="$path/$app"
+		local escaped_app_dir
+		escaped_app_dir=$(appdeploy_escape_single_quotes "$app_dir")
+		if ! appdeploy_cmd_run "$target" "test -d '${escaped_app_dir}'" 2>/dev/null; then
+			continue
+		fi
+		
+		local escaped_app
+		escaped_app=$(appdeploy_escape_single_quotes "$app")
+		local active
+		active=$(appdeploy_cmd_run "$target" "cat '${escaped_path}/${escaped_app}/.active' 2>/dev/null" || true)
+		
+		local version_display="-"
+		local status="inactive"
+		local active_flag="no"
+		local running="no"
+		local runtime="-"
+		local pid="-"
+		
+		if [[ -n "$active" ]]; then
+			version_display="$active"
+			active_flag="yes"
+			local runtime_info
+			runtime_info=$(appdeploy_service_runtime_info "$target" "$app")
+			running="${runtime_info%%|*}"
+			pid="${runtime_info#*|}"
+			pid="${pid%%|*}"
+			runtime="${runtime_info##*|}"
+			if [[ "$running" == "yes" ]]; then
+				status="running"
+			else
+				status="stopped"
+			fi
+		fi
+		
+		runtime=$(appdeploy_format_runtime "$runtime")
+		
+		printf "%-20s %-15s %-10s %-30s %-7s %-7s %-8s %s\n" "$app" "$version_display" "$status" "$app_dir" "$active_flag" "$running" "$runtime" "$pid"
+	done
 }
 
 # Function: appdeploy_service_logs TARGET PACKAGE[:VERSION] [OPTIONS]
@@ -2300,6 +2514,11 @@ function appdeploy_service_logs() {
 	local spec="$2"
 	shift 2
 	local follow=""
+	
+	if [[ -z "$spec" ]]; then
+		appdeploy_service_logs_overview "$target"
+		return $?
+	fi
 	
 	# Parse options
 	while [[ $# -gt 0 ]]; do
@@ -2352,6 +2571,52 @@ function appdeploy_service_logs() {
 	
 	# Invoke runner logs
 	appdeploy_runner_invoke "$target" "$name" "logs" "$follow"
+}
+
+# Function: appdeploy_service_logs_overview TARGET
+# Shows log availability for all packages on target
+function appdeploy_service_logs_overview() {
+	local target="$1"
+	local path
+	path=$(appdeploy_target_path "$target")
+	
+	if ! appdeploy_validate_path "$path"; then
+		return 1
+	fi
+	
+	local escaped_path
+	escaped_path=$(appdeploy_escape_single_quotes "$path")
+	
+	local apps
+	apps=$(appdeploy_cmd_run "$target" "ls -1 '${escaped_path}' 2>/dev/null | grep -v '^\\.' || true")
+	
+	if [[ -z "$apps" ]]; then
+		appdeploy_log "No packages found on $target"
+		return 0
+	fi
+	
+	for app in $apps; do
+		if ! appdeploy_validate_name "$app" 2>/dev/null; then
+			continue
+		fi
+		
+		local app_dir="$path/$app"
+		local escaped_app_dir
+		escaped_app_dir=$(appdeploy_escape_single_quotes "$app_dir")
+		if ! appdeploy_cmd_run "$target" "test -d '${escaped_app_dir}'" 2>/dev/null; then
+			continue
+		fi
+		
+		local log_dir="$path/$app/var/logs"
+		local escaped_log_dir
+		escaped_log_dir=$(appdeploy_escape_single_quotes "$log_dir")
+		
+		local status
+		status=$(appdeploy_cmd_run "$target" "if [ -d '${escaped_log_dir}' ]; then if ls -1 '${escaped_log_dir}' 2>/dev/null | grep -Eq '(^current\\.log$|\\.log$|\\.log\\.gz$|^app\\.|^app_)'; then echo present; else echo empty; fi; else echo missing; fi" || true)
+		[[ -z "$status" ]] && status="missing"
+		
+		printf "%-20s %-10s %s\n" "$app" "$status" "$log_dir"
+	done
 }
 
 # ----------------------------------------------------------------------------
@@ -2487,6 +2752,12 @@ function appdeploy_prepare() {
 	if ! appdeploy_terraform_apply "$target"; then
 		appdeploy_error "Failed to prepare target '$target'"
 		return 1
+	fi
+	
+	# Step 1.5: Update runner on target
+	appdeploy_log "Updating runner script on target"
+	if ! appdeploy_runner_deploy "$target"; then
+		appdeploy_warn "Failed to deploy runner script to target"
 	fi
 	
 	# Step 2: Display installed packages
@@ -2929,31 +3200,35 @@ function appdeploy_restart() {
 # Function: appdeploy_status PACKAGE[:VERSION] [TARGET]
 # Show service status
 function appdeploy_status() {
-	if [[ $# -lt 1 ]]; then
-		appdeploy_error "Usage: appdeploy status PACKAGE[:VERSION] [TARGET]"
-		return 1
+	local spec=""
+	local target=""
+	
+	if [[ $# -eq 0 ]]; then
+		target="$(appdeploy_default_target)"
+	elif [[ $# -eq 1 ]]; then
+		if appdeploy_is_target "$1"; then
+			target="$1"
+		else
+			spec="$1"
+		fi
+	else
+		spec="$1"
+		target="$2"
 	fi
 	
-	local spec="$1"
-	local target="${2:-$(appdeploy_default_target)}"
+	[[ -z "$target" ]] && target="$(appdeploy_default_target)"
 	
 	appdeploy_service_status "$target" "$spec"
 }
 
-# Function: appdeploy_logs PACKAGE[:VERSION] [TARGET] [-f]
-# Show service logs
+# Function: appdeploy_logs [PACKAGE[:VERSION]] [TARGET] [-f]
+# Show service logs (or log availability when PACKAGE omitted)
 function appdeploy_logs() {
-	if [[ $# -lt 1 ]]; then
-		appdeploy_error "Usage: appdeploy logs PACKAGE[:VERSION] [TARGET] [-f]"
-		return 1
-	fi
-	
-	local spec="$1"
-	shift
+	local spec=""
 	local target=""
 	local follow_args=()
 	
-	# Parse remaining arguments
+	# Parse arguments
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 			-f|--follow)
@@ -2961,7 +3236,9 @@ function appdeploy_logs() {
 				shift
 				;;
 			*)
-				if [[ -z "$target" ]]; then
+				if [[ -z "$spec" ]]; then
+					spec="$1"
+				elif [[ -z "$target" ]]; then
 					target="$1"
 				fi
 				shift
@@ -2969,7 +3246,17 @@ function appdeploy_logs() {
 		esac
 	done
 	
+	if [[ -n "$spec" && -z "$target" ]] && appdeploy_is_target "$spec"; then
+		target="$spec"
+		spec=""
+	fi
+	
 	[[ -z "$target" ]] && target="$(appdeploy_default_target)"
+	
+	if [[ -z "$spec" ]]; then
+		appdeploy_service_logs "$target" ""
+		return $?
+	fi
 	
 	appdeploy_service_logs "$target" "$spec" "${follow_args[@]}"
 }
@@ -3267,12 +3554,13 @@ function appdeploy_help_status() {
 	echo "${BOLD}appdeploy status - Show service status${RESET}"
 	echo ""
 	echo "${BOLD}Usage:${RESET}"
-	echo "  appdeploy status PACKAGE[:VERSION] [TARGET]"
+	echo "  appdeploy status [PACKAGE[:VERSION]] [TARGET]"
 	echo ""
 	echo "${BOLD}Arguments:${RESET}"
 	printf "  %-20s %s\n" "PACKAGE" "Package name"
 	printf "  %-20s %s\n" "VERSION" "Optional version"
 	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	printf "  %-20s %s\n" "(no PACKAGE)" "Show status for all packages"
 	echo ""
 	echo "${BOLD}Status Values:${RESET}"
 	printf "  %-20s %s\n" "running" "Service is active and running (green)"
@@ -3280,6 +3568,8 @@ function appdeploy_help_status() {
 	printf "  %-20s %s\n" "inactive" "Package exists but not activated"
 	echo ""
 	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy status"
+	echo "  appdeploy status user@host:/opt/apps"
 	echo "  appdeploy status myapp"
 	echo "  appdeploy status myapp:1.0.0 user@host:/opt/apps"
 }
@@ -3290,17 +3580,20 @@ function appdeploy_help_logs() {
 	echo "${BOLD}appdeploy logs - Show service logs${RESET}"
 	echo ""
 	echo "${BOLD}Usage:${RESET}"
-	echo "  appdeploy logs PACKAGE[:VERSION] [TARGET] [-f]"
+	echo "  appdeploy logs [PACKAGE[:VERSION]] [TARGET] [-f]"
 	echo ""
 	echo "${BOLD}Arguments:${RESET}"
 	printf "  %-20s %s\n" "PACKAGE" "Package name"
 	printf "  %-20s %s\n" "VERSION" "Optional version"
 	printf "  %-20s %s\n" "TARGET" "Target (default: :$APPDEPLOY_TARGET)"
+	printf "  %-20s %s\n" "(no PACKAGE)" "Show log availability for all packages"
 	echo ""
 	echo "${BOLD}Options:${RESET}"
 	printf "  %-20s %s\n" "-f, --follow" "Follow logs in real-time (like tail -f)"
 	echo ""
 	echo "${BOLD}Examples:${RESET}"
+	echo "  appdeploy logs"
+	echo "  appdeploy logs user@host:/opt/apps"
 	echo "  appdeploy logs myapp"
 	echo "  appdeploy logs myapp -f"
 	echo "  appdeploy logs myapp user@host:/opt/apps -f"
