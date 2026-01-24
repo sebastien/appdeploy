@@ -4,7 +4,9 @@
 set -euo pipefail
 
 BASE_PATH="$(dirname "$(dirname "$(readlink -f "$0")")")"
+# shellcheck source=tests/lib-testing.sh
 source "$BASE_PATH/tests/lib-testing.sh"
+# shellcheck source=src/sh/appdeploy.sh
 source "$BASE_PATH/src/sh/appdeploy.sh"
 
 test-start "appdeploy-run-verification"

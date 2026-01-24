@@ -4,7 +4,9 @@
 set -euo pipefail
 
 BASE_PATH="$(dirname "$(dirname "$(readlink -f "$0")")")"
+# shellcheck source=tests/lib-testing.sh
 source "$BASE_PATH/tests/lib-testing.sh"
+# shellcheck source=src/sh/appdeploy.sh
 source "$BASE_PATH/src/sh/appdeploy.sh"
 
 test-start "appdeploy-package"
@@ -17,7 +19,7 @@ EXAMPLES_DIR="$BASE_PATH/examples/hello-service"
 test-step "Package with auto-inferred version"
 output=$(appdeploy_package "$EXAMPLES_DIR" 2>&1)
 # Find the created package
-pkg_file=$(ls -1 hello-service-*.tar.gz 2>/dev/null | head -1)
+pkg_file=$(find . -maxdepth 1 -type f -name 'hello-service-*.tar.gz' -print | head -n 1)
 test-noempty "$pkg_file" "Package file created with inferred version"
 test-exist "$pkg_file" "Package file exists"
 

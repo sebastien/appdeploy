@@ -86,11 +86,20 @@ dist: dist/appdeploy dist/docs/manual.html dist/docs/appdeploy.1
 
 .PHONY: check
 check:
-	@if ! which shellcheck 2> /dev/null; then \
+	@if ! which shellcheck >/dev/null 2>&1; then \
 		echo "!!! ERR Cannot find 'shellcheck'"; \
 		exit 1; \
 	fi
-	find . -name "*.sh" -exec shellcheck {} \;
+	@files="$$({ \
+		find . -path './build' -prune -o \
+			-path './dist' -prune -o \
+			-path './tmp.testing.*' -prune -o \
+			-name '*.sh' -print; \
+	} | sort)"; \
+	if [ -n "$$files" ]; then \
+		echo "... Running shellcheck"; \
+		shellcheck $$files; \
+	fi
 
 .PHONY: clean
 clean:

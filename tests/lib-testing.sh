@@ -298,7 +298,8 @@ function test-run {
 }
 
 function test_log_run {
-	local prefix="$(test_prefix)$1"
+	local prefix
+	prefix="$(test_prefix)$1"
 	shift
 	"$@" 2> >(sed "s/^/${RED}${prefix} /" >&2) > >(sed "s/^/${BLUE}${prefix} /")
 	return $?
@@ -514,8 +515,10 @@ function test-data {
 
 function test-diff {
 	if [ "$1" != "$2" ]; then
-		local a=$(mktemp -p "$TEST_PATH" var.XXX)
-		local b=$(mktemp -p "$TEST_PATH" var.XXX)
+		local a
+		local b
+		a=$(mktemp -p "$TEST_PATH" var.XXX)
+		b=$(mktemp -p "$TEST_PATH" var.XXX)
 		echo "$1" >"$a"
 		echo "$2" >"$b"
 		test_log "${ORANGE}>>> Retrieved/Expected"
@@ -630,16 +633,20 @@ function test-tempfile() {
 	local parent="${TEST_PATH:-/tmp}"
 	local tmp
 	if [[ -n "${prefix}" ]] && [[ -n "${suffix}" ]]; then
-		tmp=$(mktemp -p "$parent" -t "${prefix}.XXXXXX${suffix}")
+		if ! tmp=$(mktemp -p "$parent" -t "${prefix}.XXXXXX${suffix}"); then
+			test-abort "Failed to create temporary file"
+			exit 1
+		fi
 	elif [[ -n "${prefix}" ]]; then
-		tmp=$(mktemp -p "$parent" -t "${prefix}.XXXXXX")
+		if ! tmp=$(mktemp -p "$parent" -t "${prefix}.XXXXXX"); then
+			test-abort "Failed to create temporary file"
+			exit 1
+		fi
 	else
-		tmp=$(mktemp -p "$parent")
-	fi
-
-	if [[ $? -ne 0 ]]; then
-		test-abort "Failed to create temporary file"
-		exit 1
+		if ! tmp=$(mktemp -p "$parent"); then
+			test-abort "Failed to create temporary file"
+			exit 1
+		fi
 	fi
 	TEST_CLEAN+=("${tmp}")
 	echo "${tmp}"

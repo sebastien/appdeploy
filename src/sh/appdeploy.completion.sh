@@ -8,6 +8,7 @@
 # Function: _appdeploy_complete()
 # Provides completion for the appdeploy command and its subcommands.
 _appdeploy_complete() {
+	# shellcheck disable=SC2034  # words and cword required by completion API
 	local cur prev words cword
 	_init_completion || return
 
@@ -24,15 +25,15 @@ _appdeploy_complete() {
 	case "$prev" in
 	appdeploy)
 		# Complete main commands
-		COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+		readarray -t COMPREPLY < <(compgen -W "$commands" -- "$cur")
 		;;
 	package)
 		# Complete package subcommands
-		COMPREPLY=($(compgen -W "$package_subcommands" -- "$cur"))
+		readarray -t COMPREPLY < <(compgen -W "$package_subcommands" -- "$cur")
 		;;
 	target)
 		# Complete target subcommands
-		COMPREPLY=($(compgen -W "$target_subcommands" -- "$cur"))
+		readarray -t COMPREPLY < <(compgen -W "$target_subcommands" -- "$cur")
 		;;
 	run)
 		# Complete run subcommands (if any)
