@@ -30,7 +30,7 @@ APP_ENV_SCRIPT="${APP_ENV_SCRIPT:-}"  # Optional: path to env.sh to source befor
 APP_LOG_SIZE="${APP_LOG_SIZE:-10M}" # 10MB default for rotatelogs
 APP_LOG_COUNT="${APP_LOG_COUNT:-7}" # Keep 7 rotated logs
 APP_RUN_USER="${APP_RUN_USER:-$(whoami)}"
-APP_USE_SYSTEMD="${APP_USE_SYSTEMD:-auto}" # auto, true, false
+APP_USE_SYSTEMD="${APP_USE_SYSTEMD:-false}" # auto, true, false
 
 # Runner version - used for compatibility checking
 APPDEPLOY_RUNNER_VERSION="${APPDEPLOY_RUNNER_VERSION:-1.0.0}"
@@ -223,38 +223,8 @@ appdeploy_runner_program_fail() {
 # Dependency status tracking
 SYSTEMD_AVAILABLE=false
 ROTATELOGS_AVAILABLE=false
-ROTATELOGS_INSTALLABLE=false
-PACKAGE_MANAGER=""
-ROTATELOGS_PACKAGE=""
 
-# Function: appdeploy_runner_detect_package_manager
-# Detects the system package manager and sets appropriate rotatelogs package name
-appdeploy_runner_detect_package_manager() {
-	if command -v apt-get >/dev/null 2>&1; then
-		PACKAGE_MANAGER="apt"
-		ROTATELOGS_PACKAGE="apache2-utils"
-		return 0
-	elif command -v dnf >/dev/null 2>&1; then
-		PACKAGE_MANAGER="dnf"
-		ROTATELOGS_PACKAGE="httpd-tools"
-		return 0
-	elif command -v yum >/dev/null 2>&1; then
-		PACKAGE_MANAGER="yum"
-		ROTATELOGS_PACKAGE="httpd-tools"
-		return 0
-	elif command -v pacman >/dev/null 2>&1; then
-		PACKAGE_MANAGER="pacman"
-		ROTATELOGS_PACKAGE="apache"
-		return 0
-	elif command -v zypper >/dev/null 2>&1; then
-		PACKAGE_MANAGER="zypper"
-		ROTATELOGS_PACKAGE="apache2-utils"
-		return 0
-	else
-		PACKAGE_MANAGER="unknown"
-		return 1
-	fi
-}
+
 
 # Function: appdeploy_runner_check_systemd
 # Checks if systemd is available and running
@@ -288,7 +258,7 @@ appdeploy_runner_check_systemd() {
 }
 
 # Function: appdeploy_runner_check_rotatelogs
-# Checks if rotatelogs is available or installable
+# Checks if rotatelogs is available
 appdeploy_runner_check_rotatelogs() {
 	appdeploy_runner_debug "Checking rotatelogs availability..."
 
@@ -298,18 +268,28 @@ appdeploy_runner_check_rotatelogs() {
 		return 0
 	else
 		appdeploy_runner_warn "! rotatelogs not found"
-
-		# Check if we can install it
-		if [ "$PACKAGE_MANAGER" != "unknown" ]; then
-			ROTATELOGS_INSTALLABLE=true
-			appdeploy_runner_info "+ rotatelogs can be installed via: $PACKAGE_MANAGER install $ROTATELOGS_PACKAGE"
-		else
-			appdeploy_runner_warn "! Cannot determine how to install rotatelogs on this system"
-		fi
-
 		ROTATELOGS_AVAILABLE=false
 		return 1
 	fi
+}
+
+# Function: appdeploy_runner_available
+# Returns a space-separated list of available tools/features
+appdeploy_runner_available() {
+	appdeploy_runner_check_systemd
+	appdeploy_runner_check_rotatelogs
+
+	local available=""
+	if [ "$SYSTEMD_AVAILABLE" = "true" ]; then
+		available="${available}systemd "
+	fi
+	if [ "$ROTATELOGS_AVAILABLE" = "true" ]; then
+		available="${available}rotatelogs "
+	fi
+	if [ -z "$available" ]; then
+		available="manual"
+	fi
+	echo "${available% }"
 }
 
 # Function: appdeploy_runner_check_basic_tools
@@ -418,6 +398,9 @@ appdeploy_runner_check_permissions() {
 # Function: appdeploy_runner_show_dependency_summary
 # Displays a summary of all dependency checks
 appdeploy_runner_show_dependency_summary() {
+	local available_tools
+	available_tools=$(appdeploy_runner_available)
+
 	echo
 	appdeploy_runner_program "=== Dependency Check Summary"
 
@@ -428,83 +411,30 @@ appdeploy_runner_show_dependency_summary() {
 		"$([ "$SYSTEMD_AVAILABLE" = "true" ] && printf 'Available' || printf 'Not available')"
 
 	printf '\n%s--- Log Rotation Options%s\n' "$BLUE" "$RESET"
-	if [ "$ROTATELOGS_AVAILABLE" = "true" ]; then
-		printf '  + rotatelogs: Available (pipe-based rotation)\n'
-	elif [ "$ROTATELOGS_INSTALLABLE" = "true" ]; then
-		printf '  ! rotatelogs: Not installed (can install with: %s install %s)\n' "$PACKAGE_MANAGER" "$ROTATELOGS_PACKAGE"
-	else
-		printf '  - rotatelogs: Not available\n'
-	fi
+	printf '  %s rotatelogs: %s\n' \
+		"$([ "$ROTATELOGS_AVAILABLE" = "true" ] && printf '+' || printf '-')" \
+		"$([ "$ROTATELOGS_AVAILABLE" = "true" ] && printf 'Available' || printf 'Not available')"
 	printf '  + Manual rotation: Always available (fallback)\n'
 
-	printf '\n%s--- Recommended Setup%s\n' "$BLUE" "$RESET"
-	if [ "$SYSTEMD_AVAILABLE" = "true" ] && [ "$ROTATELOGS_AVAILABLE" = "true" ]; then
-		printf '  [*] Optimal: systemd + rotatelogs (best features)\n'
-	elif [ "$SYSTEMD_AVAILABLE" = "true" ] && [ "$ROTATELOGS_INSTALLABLE" = "true" ]; then
-		printf '  [+] Good: systemd + rotatelogs (install rotatelogs first)\n'
-		printf '      Install with: sudo %s install %s\n' "$PACKAGE_MANAGER" "$ROTATELOGS_PACKAGE"
-	elif [ "$SYSTEMD_AVAILABLE" = "true" ]; then
-		printf '  [~] Basic: systemd + journald (system log management)\n'
-	else
-		printf '  [.] Manual: Custom daemon + manual log rotation\n'
-	fi
+	printf '\n%s--- Available Tools%s\n' "$BLUE" "$RESET"
+	printf '  Available tools: %s\n' "$available_tools"
+
+	printf '\n%s--- Default Setup%s\n' "$BLUE" "$RESET"
+	printf '  [.] Manual: Custom daemon + manual log rotation (default)\n'
 
 	echo
 }
 
-# Function: appdeploy_runner_install_missing_dependencies
-# Offers to install missing optional dependencies
-appdeploy_runner_install_missing_dependencies() {
-	local install_rotatelogs=false
 
-	if [ "$ROTATELOGS_INSTALLABLE" = "true" ] && [ "$ROTATELOGS_AVAILABLE" = "false" ]; then
-		echo
-		read -p "Install rotatelogs ($ROTATELOGS_PACKAGE) for better log rotation? (y/N): " -n 1 -r
-		echo
-		if [[ $REPLY =~ ^[Yy]$ ]]; then
-			install_rotatelogs=true
-		fi
-	fi
 
-	if [ "$install_rotatelogs" = "true" ]; then
-		appdeploy_runner_log "Installing $ROTATELOGS_PACKAGE..."
-
-		case "$PACKAGE_MANAGER" in
-		apt)
-			sudo apt-get update && sudo apt-get install -y "$ROTATELOGS_PACKAGE"
-			;;
-		dnf)
-			sudo dnf install -y "$ROTATELOGS_PACKAGE"
-			;;
-		yum)
-			sudo yum install -y "$ROTATELOGS_PACKAGE"
-			;;
-		pacman)
-			sudo pacman -S --noconfirm "$ROTATELOGS_PACKAGE"
-			;;
-		zypper)
-			sudo zypper install -y "$ROTATELOGS_PACKAGE"
-			;;
-		esac
-
-		# Re-check rotatelogs availability
-		if command -v rotatelogs >/dev/null 2>&1; then
-			ROTATELOGS_AVAILABLE=true
-			appdeploy_runner_step_ok "+ rotatelogs installed successfully"
-		else
-			appdeploy_runner_step_fail "- Failed to install rotatelogs"
-		fi
-	fi
-}
-
-# Function: appdeploy_runner_comprehensive_dependency_check [install]
-# Runs all dependency checks and optionally offers to install missing deps
+# Function: appdeploy_runner_comprehensive_dependency_check
+# Runs all dependency checks
 appdeploy_runner_comprehensive_dependency_check() {
 	appdeploy_runner_program "=== Checking Dependencies"
 	echo
 
 	local checks_passed=0
-	local total_checks=5
+	local total_checks=4
 
 	# Check basic tools (critical)
 	if appdeploy_runner_check_basic_tools; then
@@ -522,10 +452,6 @@ appdeploy_runner_comprehensive_dependency_check() {
 		exit 1
 	fi
 
-	# Detect package manager
-	appdeploy_runner_detect_package_manager
-	((checks_passed++))
-
 	# Check systemd (optional but preferred)
 	if appdeploy_runner_check_systemd; then
 		((checks_passed++))
@@ -540,19 +466,12 @@ appdeploy_runner_comprehensive_dependency_check() {
 	appdeploy_runner_check_permissions # Don't fail on permission issues, just warn
 
 	# Determine final configuration
-	if [ "$APP_USE_SYSTEMD" = "auto" ]; then
-		APP_USE_SYSTEMD="$SYSTEMD_AVAILABLE"
-	elif [ "$APP_USE_SYSTEMD" = "true" ] && [ "$SYSTEMD_AVAILABLE" = "false" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ] && [ "$SYSTEMD_AVAILABLE" = "false" ]; then
 		appdeploy_runner_warn "systemd requested but not available, falling back to manual daemon"
 		APP_USE_SYSTEMD=false
 	fi
 
 	appdeploy_runner_show_dependency_summary
-
-	# Offer to install missing dependencies
-	if [ "${1:-}" = "install" ]; then
-		appdeploy_runner_install_missing_dependencies
-	fi
 
 	appdeploy_runner_result "Dependency check complete ($checks_passed/$total_checks optimal)"
 	echo
@@ -562,46 +481,7 @@ appdeploy_runner_comprehensive_dependency_check() {
 # SERVICE INSTALLATION
 # ============================================================================
 
-# Function: appdeploy_runner_install_rotatelogs
-# Installs rotatelogs if not present and installable
-appdeploy_runner_install_rotatelogs() {
-	if ! command -v rotatelogs >/dev/null 2>&1; then
-		if [ "$ROTATELOGS_INSTALLABLE" = "true" ]; then
-			appdeploy_runner_log "Installing rotatelogs ($ROTATELOGS_PACKAGE)..."
 
-			case "$PACKAGE_MANAGER" in
-			apt)
-				sudo apt-get update && sudo apt-get install -y "$ROTATELOGS_PACKAGE"
-				;;
-			dnf)
-				sudo dnf install -y "$ROTATELOGS_PACKAGE"
-				;;
-			yum)
-				sudo yum install -y "$ROTATELOGS_PACKAGE"
-				;;
-			pacman)
-				sudo pacman -S --noconfirm "$ROTATELOGS_PACKAGE"
-				;;
-			zypper)
-				sudo zypper install -y "$ROTATELOGS_PACKAGE"
-				;;
-			esac
-
-			# Verify installation
-			if command -v rotatelogs >/dev/null 2>&1; then
-				ROTATELOGS_AVAILABLE=true
-				return 0
-			else
-				appdeploy_runner_error "Failed to install rotatelogs"
-				return 1
-			fi
-		else
-			appdeploy_runner_warn "Cannot install rotatelogs automatically on this system"
-			return 1
-		fi
-	fi
-	return 0
-}
 
 # Function: appdeploy_runner_setup_log_cleanup
 # Sets up a cron job for log cleanup when using rotatelogs
@@ -1063,13 +943,13 @@ Commands:
     help        Show this help
 
 Environment Variables:
-    APP_NAME         Service name (default: myapp)
-    APP_SCRIPT       Path to script to run (default: ./run.sh)
-    APP_ENV_SCRIPT   Path to env script to source before run (optional)
-    APP_LOG_SIZE     Log rotation size (default: 10M)
-    APP_LOG_COUNT    Number of rotated logs to keep (default: 7)
-    APP_RUN_USER     User to run service as (default: current user)
-    APP_USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
+     APP_NAME         Service name (default: myapp)
+     APP_SCRIPT       Path to script to run (default: ./run.sh)
+     APP_ENV_SCRIPT   Path to env script to source before run (optional)
+     APP_LOG_SIZE     Log rotation size (default: 10M)
+     APP_LOG_COUNT    Number of rotated logs to keep (default: 7)
+     APP_RUN_USER     User to run service as (default: current user)
+     APP_USE_SYSTEMD  Use systemd: auto/true/false (default: false)
 
 EOF
 }
