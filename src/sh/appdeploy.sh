@@ -287,10 +287,11 @@ function appdeploy_runner_invoke() {
 	# Build environment variables for runner
 	local env_vars="APP_NAME='${escaped_package}'"
 	env_vars+=" APP_SCRIPT='${escaped_path}/${escaped_package}/run/run.sh'"
-	env_vars+=" LOG_DIR='${escaped_path}/${escaped_package}/var/logs'"
-	env_vars+=" PID_FILE='${escaped_path}/${escaped_package}/.pid'"
-	[[ -n "$user" ]] && env_vars+=" RUN_USER='${user}'"
-	env_vars+=" USE_SYSTEMD=auto"
+	env_vars+=" APP_ENV_SCRIPT='${escaped_path}/${escaped_package}/run/env.sh'"
+	env_vars+=" APP_LOG_DIR='${escaped_path}/${escaped_package}/var/logs'"
+	env_vars+=" APP_PID_FILE='${escaped_path}/${escaped_package}/.pid'"
+	[[ -n "$user" ]] && env_vars+=" APP_RUN_USER='${user}'"
+	env_vars+=" APP_USE_SYSTEMD=auto"
 	
 	# Invoke runner
 	appdeploy_cmd_run "$target" "${env_vars} '${escaped_path}/appdeploy.runner.sh' ${cmd} ${args}"
@@ -394,11 +395,17 @@ function appdeploy_program_fail() {
 # ARGUMENT PARSING
 # ============================================================================
 function appdeploy_target_user() {
-	[[ $1 =~ ^([^@:]+)(@.*)?$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+	if [[ $1 =~ ^([^@:]+)(@.*)?$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	fi
+	return 0
 }
 
 function appdeploy_target_host() {
-	[[ $1 =~ ^([^@]*@)?([^:@]+)(:.*)?$ ]] && printf '%s\n' "${BASH_REMATCH[2]}"
+	if [[ $1 =~ ^([^@]*@)?([^:@]+)(:.*)?$ ]]; then
+		printf '%s\n' "${BASH_REMATCH[2]}"
+	fi
+	return 0
 }
 
 function appdeploy_target_path() {
@@ -974,6 +981,12 @@ function appdeploy_package_deactivate() {
 	fi
 	
 	appdeploy_program "Deactivate package $name:$active_version"
+	
+	# Stop and disable the service before deactivating
+	appdeploy_step "Stopping and disabling service"
+	appdeploy_runner_invoke "$target" "$name" stop 2>/dev/null || true
+	appdeploy_runner_invoke "$target" "$name" disable 2>/dev/null || true
+	
 	appdeploy_step "Removing symlinks from $(appdeploy_format_path "$run_dir")"
 	
 	# Remove all symlinks in run directory
@@ -1109,6 +1122,11 @@ function appdeploy_package_remove() {
 	
 	local escaped_version
 	escaped_version=$(appdeploy_escape_single_quotes "$version")
+	
+	# Stop and disable service if running (ignore errors - might not be running)
+	appdeploy_log "Stopping and disabling service if running..."
+	appdeploy_runner_invoke "$target" "$name" stop 2>/dev/null || true
+	appdeploy_runner_invoke "$target" "$name" disable 2>/dev/null || true
 	
 	# Uninstall first (this handles deactivation too)
 	appdeploy_package_uninstall "$target" "$name:$version"

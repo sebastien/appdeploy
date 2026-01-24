@@ -48,6 +48,13 @@ appdeploy list [PACKAGE[:VERSION]] [TARGET]
 
 # Deploy configuration archive to package var/ directory
 appdeploy configure PACKAGE[:VERSION] CONF_ARCHIVE [TARGET]
+
+# Service Management (runner auto-deployed on activate/start)
+appdeploy start PACKAGE[:VERSION] [TARGET]      # Start service (auto-activates if needed)
+appdeploy stop PACKAGE[:VERSION] [TARGET]       # Stop service daemon
+appdeploy restart PACKAGE[:VERSION] [TARGET]    # Restart service (stop + start)
+appdeploy status PACKAGE[:VERSION] [TARGET]     # Show service status (running/stopped)
+appdeploy logs PACKAGE[:VERSION] [TARGET] [-f]  # Show logs (-f to follow)
 ```
 
 ## Formats

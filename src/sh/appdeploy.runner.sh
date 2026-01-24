@@ -15,26 +15,28 @@
 # Environment Variables:
 #   APP_NAME     Service name (default: myapp)
 #   APP_SCRIPT   Path to script to run (default: ./run.sh)
-#   LOG_SIZE     Log rotation size (default: 10M)
-#   LOG_COUNT    Number of rotated logs to keep (default: 7)
-#   RUN_USER     User to run service as (default: current user)
-#   USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
+#   APP_LOG_SIZE     Log rotation size (default: 10M)
+#   APP_LOG_COUNT    Number of rotated logs to keep (default: 7)
+#   APP_RUN_USER     User to run service as (default: current user)
+#   APP_USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
+#   APP_ENV_SCRIPT   Path to env script to source before run.sh (optional)
 
 set -euo pipefail
 
 # Configuration
 APP_NAME="${APP_NAME:-myapp}"
 APP_SCRIPT="${APP_SCRIPT:-./run.sh}"
-LOG_SIZE="${LOG_SIZE:-10M}" # 10MB default for rotatelogs
-LOG_COUNT="${LOG_COUNT:-7}" # Keep 7 rotated logs
-RUN_USER="${RUN_USER:-$(whoami)}"
-USE_SYSTEMD="${USE_SYSTEMD:-auto}" # auto, true, false
+APP_ENV_SCRIPT="${APP_ENV_SCRIPT:-}"  # Optional: path to env.sh to source before run
+APP_LOG_SIZE="${APP_LOG_SIZE:-10M}" # 10MB default for rotatelogs
+APP_LOG_COUNT="${APP_LOG_COUNT:-7}" # Keep 7 rotated logs
+APP_RUN_USER="${APP_RUN_USER:-$(whoami)}"
+APP_USE_SYSTEMD="${APP_USE_SYSTEMD:-auto}" # auto, true, false
 
 # Paths (can be overridden via environment variables)
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SYSTEM_SYSTEMD_DIR="/etc/systemd/system"
-LOG_DIR="${LOG_DIR:-/var/log/$APP_NAME}"
-PID_FILE="${PID_FILE:-/tmp/${APP_NAME}.pid}"
+APP_LOG_DIR="${APP_LOG_DIR:-/var/log/$APP_NAME}"
+APP_PID_FILE="${APP_PID_FILE:-/tmp/${APP_NAME}.pid}"
 
 # --
 # ## Color library
@@ -203,7 +205,7 @@ appdeploy_runner_check_systemd() {
 			appdeploy_runner_info "+ systemd is available and running"
 
 			# Check if we can use user services
-			if [ "$RUN_USER" != "root" ] && [ "$(id -u)" != "0" ]; then
+			if [ "$APP_RUN_USER" != "root" ] && [ "$(id -u)" != "0" ]; then
 				if systemctl --user --version >/dev/null 2>&1; then
 					appdeploy_runner_info "+ systemd user services available"
 				else
@@ -303,29 +305,29 @@ appdeploy_runner_check_permissions() {
 	local issues=()
 
 	# Check log directory permissions
-	if [ -d "$LOG_DIR" ]; then
-		if [ ! -w "$LOG_DIR" ]; then
-			issues+=("Cannot write to log directory: $LOG_DIR")
+	if [ -d "$APP_LOG_DIR" ]; then
+		if [ ! -w "$APP_LOG_DIR" ]; then
+			issues+=("Cannot write to log directory: $APP_LOG_DIR")
 		fi
 	else
 		# Check if we can create the log directory
 		local parent_dir
-		parent_dir=$(dirname "$LOG_DIR")
+		parent_dir=$(dirname "$APP_LOG_DIR")
 		if [ ! -w "$parent_dir" ]; then
-			issues+=("Cannot create log directory: $LOG_DIR (parent not writable)")
+			issues+=("Cannot create log directory: $APP_LOG_DIR (parent not writable)")
 		fi
 	fi
 
 	# Check PID file directory
 	local pid_dir
-	pid_dir=$(dirname "$PID_FILE")
+	pid_dir=$(dirname "$APP_PID_FILE")
 	if [ ! -w "$pid_dir" ]; then
-		issues+=("Cannot write PID file: $PID_FILE (directory not writable)")
+		issues+=("Cannot write PID file: $APP_PID_FILE (directory not writable)")
 	fi
 
 	# Check systemd service directory permissions
 	if [ "$SYSTEMD_AVAILABLE" = "true" ]; then
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			if [ ! -w "$SYSTEM_SYSTEMD_DIR" ]; then
 				issues+=("Cannot write to system systemd directory: $SYSTEM_SYSTEMD_DIR")
 			fi
@@ -475,11 +477,11 @@ appdeploy_runner_comprehensive_dependency_check() {
 	appdeploy_runner_check_permissions # Don't fail on permission issues, just warn
 
 	# Determine final configuration
-	if [ "$USE_SYSTEMD" = "auto" ]; then
-		USE_SYSTEMD="$SYSTEMD_AVAILABLE"
-	elif [ "$USE_SYSTEMD" = "true" ] && [ "$SYSTEMD_AVAILABLE" = "false" ]; then
+	if [ "$APP_USE_SYSTEMD" = "auto" ]; then
+		APP_USE_SYSTEMD="$SYSTEMD_AVAILABLE"
+	elif [ "$APP_USE_SYSTEMD" = "true" ] && [ "$SYSTEMD_AVAILABLE" = "false" ]; then
 		appdeploy_runner_warn "systemd requested but not available, falling back to manual daemon"
-		USE_SYSTEMD=false
+		APP_USE_SYSTEMD=false
 	fi
 
 	appdeploy_runner_show_dependency_summary
@@ -547,13 +549,13 @@ appdeploy_runner_setup_log_cleanup() {
 	sudo tee "$cleanup_script" >/dev/null <<EOF
 #!/bin/bash
 # Auto-generated log cleanup script for $APP_NAME
-find "$LOG_DIR" -name "app.*" -mtime +$LOG_COUNT -delete
+find "$APP_LOG_DIR" -name "app.*" -mtime +$APP_LOG_COUNT -delete
 EOF
 
 	sudo chmod +x "$cleanup_script"
 
 	# Add to user's crontab or systemd timer
-	if [ "$RUN_USER" != "root" ]; then
+	if [ "$APP_RUN_USER" != "root" ]; then
 		(
 			crontab -l 2>/dev/null
 			echo "0 2 * * * $cleanup_script"
@@ -577,7 +579,7 @@ appdeploy_runner_create_systemd_service() {
 
 	app_script_abs=$(readlink -f "$APP_SCRIPT")
 
-	if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+	if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 		service_dir="$SYSTEM_SYSTEMD_DIR"
 		service_file="$service_dir/${APP_NAME}.service"
 		appdeploy_runner_log "Creating system service"
@@ -589,20 +591,34 @@ appdeploy_runner_create_systemd_service() {
 	fi
 
 	# Create log directory
-	sudo mkdir -p "$LOG_DIR"
-	if [ "$RUN_USER" != "root" ]; then
-		sudo chown -R "$RUN_USER:$RUN_USER" "$LOG_DIR"
+	sudo mkdir -p "$APP_LOG_DIR"
+	if [ "$APP_RUN_USER" != "root" ]; then
+		sudo chown -R "$APP_RUN_USER:$APP_RUN_USER" "$APP_LOG_DIR"
 	fi
 
-	# Determine log rotation method
+	# Determine log rotation method and build exec_start command
 	local exec_start
+	local env_source=""
+	
+	# Add env script sourcing if specified and exists
+	if [ -n "$APP_ENV_SCRIPT" ]; then
+		local env_script_abs
+		env_script_abs=$(readlink -f "$APP_ENV_SCRIPT" 2>/dev/null || echo "")
+		if [ -n "$env_script_abs" ] && [ -f "$env_script_abs" ]; then
+			env_source="source '$env_script_abs' && "
+			appdeploy_runner_log "Will source env script: $env_script_abs"
+		else
+			appdeploy_runner_warn "Env script not found: $APP_ENV_SCRIPT (continuing without it)"
+		fi
+	fi
+	
 	if [ "$ROTATELOGS_AVAILABLE" = "true" ]; then
 		# Use rotatelogs for pipe-based rotation
-		exec_start="$app_script_abs 2>&1 | rotatelogs '$LOG_DIR/app.%Y-%m-%d-%H_%M_%S' $LOG_SIZE"
+		exec_start="${env_source}$app_script_abs 2>&1 | rotatelogs '$APP_LOG_DIR/app.%Y-%m-%d-%H_%M_%S' $APP_LOG_SIZE"
 		appdeploy_runner_log "Using rotatelogs for log rotation"
 	else
 		# Fallback to simple logging with journald handling rotation
-		exec_start="$app_script_abs"
+		exec_start="${env_source}$app_script_abs"
 		appdeploy_runner_log "Using journald for log management"
 	fi
 
@@ -617,8 +633,8 @@ StartLimitIntervalSec=0
 Type=simple
 Restart=always
 RestartSec=5
-User=$RUN_USER
-Group=$RUN_USER
+User=$APP_RUN_USER
+Group=$APP_RUN_USER
 WorkingDirectory=$(dirname "$app_script_abs")
 ExecStart=/bin/bash -c '$exec_start'
 StandardOutput=journal
@@ -638,7 +654,7 @@ EOF
 	appdeploy_runner_log "Service file created: $service_file"
 
 	# Reload systemd and enable service
-	if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+	if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 		systemctl daemon-reload
 		systemctl enable "${APP_NAME}.service"
 	else
@@ -660,6 +676,18 @@ appdeploy_runner_create_manual_daemon() {
 	local app_script_abs
 	app_script_abs=$(readlink -f "$APP_SCRIPT")
 	local daemon_script="/tmp/${APP_NAME}-daemon.sh"
+	
+	# Resolve env script path if specified
+	local env_script_abs=""
+	if [ -n "$APP_ENV_SCRIPT" ]; then
+		env_script_abs=$(readlink -f "$APP_ENV_SCRIPT" 2>/dev/null || echo "")
+		if [ -n "$env_script_abs" ] && [ -f "$env_script_abs" ]; then
+			appdeploy_runner_log "Will source env script: $env_script_abs"
+		else
+			appdeploy_runner_warn "Env script not found: $APP_ENV_SCRIPT (continuing without it)"
+			env_script_abs=""
+		fi
+	fi
 
 	# Create daemon wrapper script
 	cat >"$daemon_script" <<'EOF'
@@ -667,18 +695,24 @@ appdeploy_runner_create_manual_daemon() {
 # Manual daemon wrapper
 
 APP_SCRIPT_ABS="$1"
-LOG_DIR="$2"
-LOG_SIZE="$3"
-LOG_COUNT="$4"
-PID_FILE="$5"
+APP_LOG_DIR="$2"
+APP_LOG_SIZE="$3"
+APP_LOG_COUNT="$4"
+APP_PID_FILE="$5"
+APP_ENV_SCRIPT="$6"
 
 # Create log directory
-mkdir -p "$LOG_DIR"
+mkdir -p "$APP_LOG_DIR"
+
+# Source env script if provided and exists
+if [ -n "$APP_ENV_SCRIPT" ] && [ -f "$APP_ENV_SCRIPT" ]; then
+    source "$APP_ENV_SCRIPT"
+fi
 
 # Function for manual log rotation
 rotate_logs() {
-    local current_log="$LOG_DIR/current.log"
-    local max_size_bytes=$((${LOG_SIZE%M} * 1024 * 1024))
+    local current_log="$APP_LOG_DIR/current.log"
+    local max_size_bytes=$((${APP_LOG_SIZE%M} * 1024 * 1024))
 
     while IFS= read -r line; do
         echo "$line" | tee -a "$current_log"
@@ -688,14 +722,14 @@ rotate_logs() {
             local size=$(stat -c%s "$current_log" 2>/dev/null || echo 0)
             if [ "$size" -gt "$max_size_bytes" ]; then
                 local timestamp=$(date +"%Y%m%d_%H%M%S")
-                local rotated_file="$LOG_DIR/app_$timestamp.log"
+                local rotated_file="$APP_LOG_DIR/app_$timestamp.log"
 
                 mv "$current_log" "$rotated_file"
                 gzip "$rotated_file" &
 
                 # Clean up old files
-                find "$LOG_DIR" -name "app_*.log.gz" -mtime +$LOG_COUNT -delete
-                ls -t "$LOG_DIR"/app_*.log.gz 2>/dev/null | tail -n +$((LOG_COUNT + 1)) | xargs rm -f
+                find "$APP_LOG_DIR" -name "app_*.log.gz" -mtime +$APP_LOG_COUNT -delete
+                ls -t "$APP_LOG_DIR"/app_*.log.gz 2>/dev/null | tail -n +$((APP_LOG_COUNT + 1)) | xargs rm -f
             fi
         fi
     done
@@ -706,7 +740,7 @@ export SERVICE_NAME="$APP_NAME"
 export SERVICE_TYPE="main"
 
 if command -v rotatelogs >/dev/null 2>&1; then
-    exec "$APP_SCRIPT_ABS" 2>&1 | rotatelogs "$LOG_DIR/app.%Y-%m-%d-%H_%M_%S" "$LOG_SIZE"
+    exec "$APP_SCRIPT_ABS" 2>&1 | rotatelogs "$APP_LOG_DIR/app.%Y-%m-%d-%H_%M_%S" "$APP_LOG_SIZE"
 else
     exec "$APP_SCRIPT_ABS" 2>&1 | rotate_logs
 fi
@@ -715,10 +749,10 @@ EOF
 	chmod +x "$daemon_script"
 
 	# Start daemon using setsid for proper daemonization
-	setsid "$daemon_script" "$app_script_abs" "$LOG_DIR" "$LOG_SIZE" "$LOG_COUNT" "$PID_FILE" &
-	echo $! >"$PID_FILE"
+	setsid "$daemon_script" "$app_script_abs" "$APP_LOG_DIR" "$APP_LOG_SIZE" "$APP_LOG_COUNT" "$APP_PID_FILE" "$env_script_abs" &
+	echo $! >"$APP_PID_FILE"
 
-	appdeploy_runner_log "Manual daemon started with PID $(cat "$PID_FILE")"
+	appdeploy_runner_log "Manual daemon started with PID $(cat "$APP_PID_FILE")"
 }
 
 # Function: appdeploy_runner_install_service
@@ -726,7 +760,7 @@ EOF
 appdeploy_runner_install_service() {
 	appdeploy_runner_comprehensive_dependency_check "install"
 
-	if [ "$USE_SYSTEMD" = "true" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
 		appdeploy_runner_create_systemd_service
 		appdeploy_runner_step_ok "Service installed using systemd"
 	else
@@ -744,15 +778,15 @@ appdeploy_runner_install_service() {
 appdeploy_runner_start_service() {
 	appdeploy_runner_comprehensive_dependency_check
 
-	if [ "$USE_SYSTEMD" = "true" ]; then
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			systemctl start "${APP_NAME}.service"
 		else
 			systemctl --user start "${APP_NAME}.service"
 		fi
 		appdeploy_runner_step_ok "Service started via systemd"
 	else
-		if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+		if [ -f "$APP_PID_FILE" ] && kill -0 "$(cat "$APP_PID_FILE")" 2>/dev/null; then
 			appdeploy_runner_warn "Service already running"
 		else
 			appdeploy_runner_create_manual_daemon
@@ -763,24 +797,24 @@ appdeploy_runner_start_service() {
 # Function: appdeploy_runner_stop_service
 # Stops the service (systemd or manual daemon)
 appdeploy_runner_stop_service() {
-	if [ "$USE_SYSTEMD" = "true" ]; then
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			systemctl stop "${APP_NAME}.service"
 		else
 			systemctl --user stop "${APP_NAME}.service"
 		fi
 		appdeploy_runner_step_ok "Service stopped via systemd"
 	else
-		if [ -f "$PID_FILE" ]; then
+		if [ -f "$APP_PID_FILE" ]; then
 			local pid
-			pid=$(cat "$PID_FILE")
+			pid=$(cat "$APP_PID_FILE")
 			if kill -0 "$pid" 2>/dev/null; then
 				kill -TERM "$pid"
-				rm -f "$PID_FILE"
+				rm -f "$APP_PID_FILE"
 				appdeploy_runner_step_ok "Manual daemon stopped"
 			else
 				appdeploy_runner_warn "Daemon not running"
-				rm -f "$PID_FILE"
+				rm -f "$APP_PID_FILE"
 			fi
 		else
 			appdeploy_runner_warn "PID file not found"
@@ -788,19 +822,50 @@ appdeploy_runner_stop_service() {
 	fi
 }
 
+# Function: appdeploy_runner_enable_service
+# Enables the service to start on boot (systemd only)
+appdeploy_runner_enable_service() {
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+			systemctl enable "${APP_NAME}.service"
+		else
+			systemctl --user enable "${APP_NAME}.service"
+		fi
+		appdeploy_runner_step_ok "Service enabled (will start on boot)"
+	else
+		appdeploy_runner_warn "Enable/disable only supported with systemd"
+		appdeploy_runner_info "Manual daemon must be started manually after reboot"
+	fi
+}
+
+# Function: appdeploy_runner_disable_service
+# Disables the service from starting on boot (systemd only)
+appdeploy_runner_disable_service() {
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+			systemctl disable "${APP_NAME}.service"
+		else
+			systemctl --user disable "${APP_NAME}.service"
+		fi
+		appdeploy_runner_step_ok "Service disabled (will not start on boot)"
+	else
+		appdeploy_runner_warn "Enable/disable only supported with systemd"
+	fi
+}
+
 # Function: appdeploy_runner_show_status
 # Shows the current status of the service
 appdeploy_runner_show_status() {
-	if [ "$USE_SYSTEMD" = "true" ]; then
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			systemctl status "${APP_NAME}.service" --no-pager
 		else
 			systemctl --user status "${APP_NAME}.service" --no-pager
 		fi
 	else
-		if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-			appdeploy_runner_info "Manual daemon running with PID $(cat "$PID_FILE")"
-			ps -p "$(cat "$PID_FILE")" -o pid,ppid,pgid,user,cmd --no-headers
+		if [ -f "$APP_PID_FILE" ] && kill -0 "$(cat "$APP_PID_FILE")" 2>/dev/null; then
+			appdeploy_runner_info "Manual daemon running with PID $(cat "$APP_PID_FILE")"
+			ps -p "$(cat "$APP_PID_FILE")" -o pid,ppid,pgid,user,cmd --no-headers
 		else
 			appdeploy_runner_info "Manual daemon not running"
 		fi
@@ -810,37 +875,37 @@ appdeploy_runner_show_status() {
 # Function: appdeploy_runner_show_logs [OPTIONS]
 # Shows logs for the service (-f for follow)
 appdeploy_runner_show_logs() {
-	if [ "$USE_SYSTEMD" = "true" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
 		if [ "${1:-}" = "-f" ]; then
-			if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+			if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 				journalctl -f -u "${APP_NAME}.service"
 			else
 				journalctl --user -f -u "${APP_NAME}.service"
 			fi
 		else
-			if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+			if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 				journalctl -u "${APP_NAME}.service" --no-pager -n 20
 			else
 				journalctl --user -u "${APP_NAME}.service" --no-pager -n 20
 			fi
 		fi
 	else
-		if [ -d "$LOG_DIR" ]; then
+		if [ -d "$APP_LOG_DIR" ]; then
 			if [ "${1:-}" = "-f" ]; then
-				if [ -f "$LOG_DIR/current.log" ]; then
-					tail -f "$LOG_DIR/current.log"
+				if [ -f "$APP_LOG_DIR/current.log" ]; then
+					tail -f "$APP_LOG_DIR/current.log"
 				else
 					appdeploy_runner_warn "No current log file found"
 				fi
 			else
-				if [ -f "$LOG_DIR/current.log" ]; then
-					tail -20 "$LOG_DIR/current.log"
+				if [ -f "$APP_LOG_DIR/current.log" ]; then
+					tail -20 "$APP_LOG_DIR/current.log"
 				else
 					appdeploy_runner_warn "No current log file found"
 				fi
 			fi
 		else
-			appdeploy_runner_error "Log directory not found: $LOG_DIR"
+			appdeploy_runner_error "Log directory not found: $APP_LOG_DIR"
 		fi
 	fi
 }
@@ -850,9 +915,9 @@ appdeploy_runner_show_logs() {
 appdeploy_runner_uninstall_service() {
 	appdeploy_runner_stop_service
 
-	if [ "$USE_SYSTEMD" = "true" ]; then
+	if [ "$APP_USE_SYSTEMD" = "true" ]; then
 		local service_file
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			service_file="$SYSTEM_SYSTEMD_DIR/${APP_NAME}.service"
 			systemctl disable "${APP_NAME}.service" 2>/dev/null || true
 		else
@@ -865,7 +930,7 @@ appdeploy_runner_uninstall_service() {
 			appdeploy_runner_log "Service file removed"
 		fi
 
-		if [ "$RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
+		if [ "$APP_RUN_USER" = "root" ] || [ "$(id -u)" = "0" ]; then
 			systemctl daemon-reload
 		else
 			systemctl --user daemon-reload
@@ -873,7 +938,7 @@ appdeploy_runner_uninstall_service() {
 	fi
 
 	# Clean up files
-	rm -f "$PID_FILE"
+	rm -f "$APP_PID_FILE"
 	rm -f "/tmp/${APP_NAME}-daemon.sh"
 	rm -f "/usr/local/bin/${APP_NAME}-log-cleanup"
 
@@ -908,18 +973,21 @@ Commands:
     start       Start the service
     stop        Stop the service
     restart     Restart the service
+    enable      Enable service to start on boot (systemd only)
+    disable     Disable service from starting on boot (systemd only)
     status      Show service status
     logs        Show recent log entries
     logs -f     Follow logs in real-time
     help        Show this help
 
 Environment Variables:
-    APP_NAME     Service name (default: myapp)
-    APP_SCRIPT   Path to script to run (default: ./run.sh)
-    LOG_SIZE     Log rotation size (default: 10M)
-    LOG_COUNT    Number of rotated logs to keep (default: 7)
-    RUN_USER     User to run service as (default: current user)
-    USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
+    APP_NAME         Service name (default: myapp)
+    APP_SCRIPT       Path to script to run (default: ./run.sh)
+    APP_ENV_SCRIPT   Path to env script to source before run (optional)
+    APP_LOG_SIZE     Log rotation size (default: 10M)
+    APP_LOG_COUNT    Number of rotated logs to keep (default: 7)
+    APP_RUN_USER     User to run service as (default: current user)
+    APP_USE_SYSTEMD  Use systemd: auto/true/false (default: auto)
 
 Dependency Check:
     The script automatically checks for:
@@ -969,6 +1037,12 @@ restart)
 	appdeploy_runner_stop_service
 	sleep 2
 	appdeploy_runner_start_service
+	;;
+enable)
+	appdeploy_runner_enable_service
+	;;
+disable)
+	appdeploy_runner_disable_service
 	;;
 status)
 	appdeploy_runner_show_status
