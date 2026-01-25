@@ -374,7 +374,8 @@ def daemonctl_config_load(app_name: str) -> AppConfig:
 
 	# Set default PID file path if not specified
 	if not config.pidfile.path:
-		config.pidfile.path = f"/tmp/{app_name}.pid"
+		app_path = daemonctl_app_path(app_name)
+		config.pidfile.path = str(app_path / "run" / ".pid")
 
 	return config
 
@@ -2011,12 +2012,34 @@ def daemonctl_cmd_restart(args: argparse.Namespace) -> int:
 
 	status = daemonctl_app_status(app_name)
 	if status["running"]:
-		code = daemonctl_cmd_stop(args)
+		# Create stop args with the stop timeout
+		stop_args = argparse.Namespace(
+			app_name=app_name,
+			timeout=getattr(args, "stop_timeout", 30),
+			force=getattr(args, "force", False),
+			signal=None,
+			wait=False,
+		)
+		code = daemonctl_cmd_stop(stop_args)
 		if code != 0 and not getattr(args, "force", False):
 			return code
-		time.sleep(0.5)  # Brief delay between stop and start
+		# Use configured delay between stop and start
+		delay = getattr(args, "delay", 0)
+		if delay > 0:
+			time.sleep(delay)
+		else:
+			time.sleep(0.5)  # Brief delay between stop and start
 
-	return daemonctl_cmd_start(args)
+	# Create start args - pass through most args but use start_timeout
+	start_args = argparse.Namespace(
+		app_name=app_name,
+		timeout=getattr(args, "start_timeout", 60),
+		verbose=getattr(args, "verbose", False),
+		wait=getattr(args, "wait", False),
+		attach=False,
+		env=getattr(args, "env", None),
+	)
+	return daemonctl_cmd_start(start_args)
 
 
 # Function: daemonctl_cmd_status ARGS
@@ -2605,6 +2628,19 @@ def daemonctl_CLI_build_parser() -> argparse.ArgumentParser:
 	p_restart.add_argument("-w", "--wait", action="store_true", help="Wait for restart")
 	p_restart.add_argument(
 		"-V", "--verbose", action="store_true", help="Verbose startup output"
+	)
+	p_restart.add_argument(
+		"--stop-timeout", type=int, default=30, metavar="SEC", help="Stop timeout"
+	)
+	p_restart.add_argument(
+		"--start-timeout", type=int, default=60, metavar="SEC", help="Start timeout"
+	)
+	p_restart.add_argument(
+		"--delay",
+		type=int,
+		default=0,
+		metavar="SEC",
+		help="Delay between stop and start",
 	)
 
 	# status command
