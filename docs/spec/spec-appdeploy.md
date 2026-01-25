@@ -298,9 +298,9 @@ run `appdeploy package` explicitly first.
 
 **Examples:**
 ```bash
-appdeploy install ./myapp server          # Packages ./myapp, then installs
-appdeploy install myapp-1.0.tar.gz server # Installs archive directly
-appdeploy upgrade ./myapp server          # Packages, installs, activates, health-checks
+appdeploy -t server install ./myapp          # Packages ./myapp, then installs
+appdeploy install myapp-1.0.tar.gz           # Installs archive to default target
+appdeploy -t server upgrade ./myapp          # Packages, installs, activates, health-checks
 ```
 
 ### Global Options
@@ -328,6 +328,55 @@ appdeploy upgrade ./myapp server          # Packages, installs, activates, healt
 - `2` - Partial success / warnings
 - `3` - User cancelled (declined confirmation)
 - `130` - Interrupted (Ctrl+C)
+
+### CLI Output Format
+
+Operation messages follow a consistent format with bracketed prefixes:
+
+```
+[TARGET] [TIME] MESSAGE [version=VERSION]
+```
+
+**Components:**
+
+| Component | When Shown | Format |
+|-----------|------------|--------|
+| `TARGET` | Always | Full target string (e.g., `user@host:/path` or `/path` for local) |
+| `TIME` | First operation only | ISO 8601 time portion (e.g., `14:30:22`) |
+| `VERSION` | App lifecycle operations | `version=X.Y.Z` suffix |
+
+**App lifecycle operations** (show version):
+- `start`, `stop`, `restart` - process lifecycle
+- `activate`, `deactivate` - version switching
+- `upgrade`, `rollback` - deployment operations
+- `kill` - signal operations
+
+**Other operations** (target + time only, no version suffix):
+- `install`, `uninstall` - package management (version appears in message body)
+- `bootstrap` - tool management
+- `list`, `status`, `logs`, `show` - query operations
+- `check`, `package`, `run` - local operations
+- `clean` - cleanup
+
+**Examples:**
+
+```
+[/opt/apps] [14:30:22] Starting myapp version=1.0.0
+[/opt/apps] Stopping myapp version=1.0.0
+[user@prod:/opt/apps] [09:15:00] Upgrading myapp to 2.0.0
+[user@prod:/opt/apps] Installing myapp-2.0.0.tar.gz
+[user@prod:/opt/apps] Activating myapp version=2.0.0
+[user@prod:/opt/apps] Health check passed
+```
+
+**Output modes:**
+
+| Mode | Behavior |
+|------|----------|
+| Normal | Standard output with prefixes |
+| `--verbose` | Additional `[verbose]` prefixed debug messages |
+| `--quiet` | Suppress all output except errors |
+| `--dry-run` | Prefix actions with `[dry-run]` |
 
 ---
 
@@ -403,7 +452,7 @@ Use `--no-layers` for quick testing without layer simulation.
 
 ## Deployment Commands
 
-### `appdeploy install [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy install [OPTIONS] PACKAGE`
 
 Uploads and unpacks archive to target. Does not activate by default.
 
@@ -426,7 +475,7 @@ atomic deployment with health checks and automatic rollback.
 
 ---
 
-### `appdeploy uninstall [OPTIONS] PACKAGE[:VERSION] [TARGET]`
+### `appdeploy uninstall [OPTIONS] PACKAGE[:VERSION]`
 
 Removes installed version from target.
 
@@ -442,7 +491,7 @@ Removes installed version from target.
 
 ---
 
-### `appdeploy activate [OPTIONS] PACKAGE[:VERSION] [TARGET]`
+### `appdeploy activate [OPTIONS] PACKAGE[:VERSION]`
 
 Sets active version by creating symlinks in `run/`.
 
@@ -474,7 +523,7 @@ either the old version remains active or the new version is fully active.
 
 ---
 
-### `appdeploy deactivate [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy deactivate [OPTIONS] PACKAGE`
 
 Removes active symlinks from `run/`.
 
@@ -487,7 +536,7 @@ Removes active symlinks from `run/`.
 
 ---
 
-### `appdeploy list [OPTIONS] [PACKAGE] [TARGET]`
+### `appdeploy list [OPTIONS] [PACKAGE]`
 
 Lists installed packages and versions.
 
@@ -507,7 +556,7 @@ otherapp        2.0.0       active      2026-01-18 09:15
 
 ---
 
-### `appdeploy upgrade [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy upgrade [OPTIONS] PACKAGE`
 
 Atomic install + activate + restart with rollback support.
 
@@ -542,7 +591,7 @@ Atomic install + activate + restart with rollback support.
 
 ---
 
-### `appdeploy rollback [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy rollback [OPTIONS] PACKAGE`
 
 Activates previous version.
 
@@ -558,7 +607,7 @@ Activates previous version.
 
 ---
 
-### `appdeploy clean [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy clean [OPTIONS] PACKAGE`
 
 Removes old inactive versions.
 
@@ -573,7 +622,7 @@ Removes old inactive versions.
 
 ---
 
-### `appdeploy bootstrap [OPTIONS] [TARGET]`
+### `appdeploy bootstrap [OPTIONS]`
 
 Installs or updates tools on target.
 
@@ -602,7 +651,7 @@ Installs `daemonctl`, `daemonrun`, `teelog` to `${TARGET}/bin/`.
 
 These commands proxy to `daemonctl` on the target.
 
-### `appdeploy start [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy start [OPTIONS] PACKAGE`
 
 Starts the active version.
 
@@ -616,7 +665,7 @@ Starts the active version.
 
 ---
 
-### `appdeploy stop [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy stop [OPTIONS] PACKAGE`
 
 Stops running application.
 
@@ -632,7 +681,7 @@ Stops running application.
 
 ---
 
-### `appdeploy restart [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy restart [OPTIONS] PACKAGE`
 
 Restarts running application.
 
@@ -649,7 +698,7 @@ Restarts running application.
 
 ---
 
-### `appdeploy status [OPTIONS] [PACKAGE] [TARGET]`
+### `appdeploy status [OPTIONS] [PACKAGE]`
 
 Shows application status.
 
@@ -664,7 +713,7 @@ Shows application status.
 
 ---
 
-### `appdeploy logs [OPTIONS] PACKAGE [TARGET]`
+### `appdeploy logs [OPTIONS] PACKAGE`
 
 Shows logs for the application.
 
@@ -723,7 +772,7 @@ Prefixes: `out:` (stdout), `err:` (stderr), `event:` (operations)
 
 ---
 
-### `appdeploy show [OPTIONS] PACKAGE[:VERSION] [TARGET]`
+### `appdeploy show [OPTIONS] PACKAGE[:VERSION]`
 
 Shows package contents and configuration.
 
@@ -737,7 +786,7 @@ Shows package contents and configuration.
 
 ---
 
-### `appdeploy kill [OPTIONS] PACKAGE [SIGNAL] [TARGET]`
+### `appdeploy kill [OPTIONS] PACKAGE [SIGNAL]`
 
 Send signal to running application.
 
@@ -753,10 +802,10 @@ Signals can be specified by name (TERM, HUP, USR1) or number (15, 1, 10).
 
 **Examples:**
 ```bash
-appdeploy kill myapp                    # Send SIGTERM
-appdeploy kill myapp HUP                # Send SIGHUP (reload)
-appdeploy kill myapp USR1 prod-server   # Send SIGUSR1 to remote
-appdeploy kill myapp 9                  # Send SIGKILL (not recommended)
+appdeploy kill myapp                         # Send SIGTERM
+appdeploy kill myapp HUP                     # Send SIGHUP (reload)
+appdeploy -t prod-server kill myapp USR1     # Send SIGUSR1 to remote
+appdeploy kill myapp 9                       # Send SIGKILL (not recommended)
 ```
 
 ---

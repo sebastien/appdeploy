@@ -23,13 +23,13 @@
 import argparse
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
 import time
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -1602,7 +1602,7 @@ def daemonctl_cmd_config_show(args: argparse.Namespace) -> int:
 
 	# Global config only
 	if show_global:
-		print(f"# Global configuration")
+		print("# Global configuration")
 		print(f"DAEMONCTL_PATH = {_base_path}")
 		print(f"DAEMONCTL_CONFIG = {DAEMONCTL_CONFIG or '(none)'}")
 		print(f"DAEMONCTL_LOG_LEVEL = {DAEMONCTL_LOG_LEVEL}")
@@ -1918,7 +1918,19 @@ def daemonctl_cmd_start(args: argparse.Namespace) -> int:
 		daemonctl_util_log("info", f"[dry-run] Would run: {' '.join(cmd)}")
 		return 0
 
-	daemonctl_util_log("info", f"Starting {app_name}...")
+	app_path = daemonctl_app_path(app_name)
+	version_file = app_path / "run" / ".version"
+	timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+	if version_file.exists():
+		version = version_file.read_text().strip()
+		daemonctl_util_log(
+			"info",
+			f"Starting {app_name} path={app_path} version={version} time={timestamp}",
+		)
+	else:
+		daemonctl_util_log(
+			"info", f"Starting {app_name} path={app_path} time={timestamp}"
+		)
 
 	# Run on-start hook
 	daemonctl_app_run_hook(app_name, "on-start")

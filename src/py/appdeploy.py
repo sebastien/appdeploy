@@ -36,7 +36,7 @@ import tempfile
 import tomllib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, NoReturn
 
 # -----------------------------------------------------------------------------
 #
@@ -64,6 +64,10 @@ _no_color = APPDEPLOY_NO_COLOR
 _dry_run = False
 _yes = False
 _op_timeout = APPDEPLOY_OP_TIMEOUT
+
+# Logging context for consistent output format
+_log_target: Optional[str] = None  # Current target string for logging
+_log_first_op = True  # Whether next operation is the first (shows time)
 
 # -----------------------------------------------------------------------------
 #
@@ -154,6 +158,53 @@ def appdeploy_util_warn(message: str) -> None:
 	color = "" if _no_color else "\033[33m"
 	reset = "" if _no_color else "\033[0m"
 	print(f"{color}warning:{reset} {message}", file=sys.stderr)
+
+
+def appdeploy_util_set_log_target(target: "Target") -> None:
+	"""Set the current target for logging context."""
+	global _log_target, _log_first_op
+	if target.is_remote:
+		if target.user:
+			_log_target = f"{target.user}@{target.host}:{target.path}"
+		else:
+			_log_target = f"{target.host}:{target.path}"
+	else:
+		_log_target = str(target.path)
+	_log_first_op = True
+
+
+def appdeploy_util_log_op(message: str, version: Optional[str] = None) -> None:
+	"""Log an operation message with consistent format.
+
+	Format: [TARGET] [TIME] MESSAGE [version=VERSION]
+	- TARGET: always shown
+	- TIME: shown only for first operation
+	- VERSION: shown for app lifecycle operations (pass version param)
+	"""
+	global _log_first_op
+	if _quiet:
+		return
+
+	parts = []
+
+	# Target prefix
+	if _log_target:
+		parts.append(f"[{_log_target}]")
+
+	# Time prefix (first operation only)
+	if _log_first_op:
+		timestamp = datetime.now().strftime("%H:%M:%S")
+		parts.append(f"[{timestamp}]")
+		_log_first_op = False
+
+	# Message
+	parts.append(message)
+
+	# Version suffix for app lifecycle operations
+	if version:
+		parts.append(f"version={version}")
+
+	print(" ".join(parts))
 
 
 def appdeploy_util_color(text: str, color: str) -> str:
@@ -904,7 +955,7 @@ def appdeploy_target_bootstrap(
 		return False
 
 	# Install/update only tools that need it
-	appdeploy_util_output(f"Updating tools in {bin_dir}")
+	appdeploy_util_log_op(f"Updating tools in {bin_dir}")
 	appdeploy_exec_mkdir(target, bin_dir)
 
 	for name, src in tools_to_update:
@@ -934,7 +985,7 @@ def appdeploy_target_install(
 
 	# Create archive if needed
 	if not pkg.is_archive:
-		appdeploy_util_output(f"Packaging {pkg.name}...")
+		appdeploy_util_log_op(f"Packaging {pkg.name}")
 		with tempfile.TemporaryDirectory() as tmpdir:
 			archive_path = Path(tmpdir) / f"{pkg.name}-{pkg.version}.tar.gz"
 			appdeploy_package_create(pkg, archive_path)
@@ -966,11 +1017,11 @@ def _do_install(
 	remote_archive = f"{packages_dir}/{archive_name}"
 
 	# Upload archive
-	appdeploy_util_output(f"Uploading {archive_name}...")
+	appdeploy_util_log_op(f"Uploading {archive_name}")
 	appdeploy_exec_copy(target, pkg.path, remote_archive)
 
 	# Extract to version directory
-	appdeploy_util_output(f"Extracting to {version_dir}...")
+	appdeploy_util_log_op(f"Extracting to {version_dir}")
 	appdeploy_exec_mkdir(target, version_dir)
 
 	# Determine tar flags based on compression
@@ -1073,12 +1124,14 @@ def appdeploy_target_activate(
 	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
 		current = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
 		if current == version:
-			appdeploy_util_output(f"{name}:{version} is already active")
+			appdeploy_util_log_op(
+				f"{name}:{version} is already active", version=version
+			)
 			return
 		# Check if running
 		was_running = appdeploy_exec_exists(target, f"{run_dir}/.pid")
 
-	appdeploy_util_output(f"Activating {name}:{version}...")
+	appdeploy_util_log_op(f"Activating {name}", version=version)
 
 	# Create run.new with layer symlinks
 	appdeploy_exec_rm(target, run_new, recursive=True)
@@ -1102,11 +1155,10 @@ def appdeploy_target_activate(
 	appdeploy_exec_rename(target, run_new, run_dir)
 	appdeploy_exec_rm(target, run_old, recursive=True)
 
-	appdeploy_util_output(f"Activated {name}:{version}")
+	appdeploy_util_log_op(f"Activated {name}", version=version)
 
 	# Restart if was running
 	if was_running and not no_restart:
-		appdeploy_util_output("Restarting...")
 		appdeploy_daemon_restart(target, name)
 
 
@@ -1119,12 +1171,16 @@ def appdeploy_target_deactivate(target: Target, name: str) -> None:
 	if appdeploy_exec_exists(target, f"{run_dir}/.pid"):
 		raise RuntimeError(f"Cannot deactivate {name}: app is running. Stop it first.")
 
-	if not appdeploy_exec_exists(target, run_dir):
-		appdeploy_util_output(f"{name} is not active")
+	# Get version for logging
+	version = None
+	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
+		version = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
+	else:
+		appdeploy_util_log_op(f"{name} is not active")
 		return
 
 	appdeploy_exec_rm(target, run_dir, recursive=True)
-	appdeploy_util_output(f"Deactivated {name}")
+	appdeploy_util_log_op(f"Deactivated {name}", version=version)
 
 
 def appdeploy_target_populate_run(
@@ -1383,7 +1439,13 @@ def appdeploy_daemon_start(
 	if verbose:
 		cmd += " --verbose"
 
-	appdeploy_util_output(f"Starting {name}...")
+	app_dir = str(target.path / name)
+	run_dir = f"{app_dir}/run"
+	version = None
+	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
+		version = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
+
+	appdeploy_util_log_op(f"Starting {name}", version=version)
 	result = appdeploy_exec_run(target, cmd, check=False, timeout=timeout + 10)
 
 	if result.returncode != 0:
@@ -1416,7 +1478,14 @@ def appdeploy_daemon_stop(
 	if wait:
 		cmd += " --wait"
 
-	appdeploy_util_output(f"Stopping {name}...")
+	# Get version for logging
+	app_dir = str(target.path / name)
+	run_dir = f"{app_dir}/run"
+	version = None
+	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
+		version = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
+
+	appdeploy_util_log_op(f"Stopping {name}", version=version)
 	result = appdeploy_exec_run(target, cmd, check=False, timeout=timeout + 10)
 
 	if result.returncode != 0:
@@ -1452,7 +1521,14 @@ def appdeploy_daemon_restart(
 	if verbose:
 		cmd += " --verbose"
 
-	appdeploy_util_output(f"Restarting {name}...")
+	# Get version for logging
+	app_dir = str(target.path / name)
+	run_dir = f"{app_dir}/run"
+	version = None
+	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
+		version = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
+
+	appdeploy_util_log_op(f"Restarting {name}", version=version)
 	total_timeout = stop_timeout + start_timeout + delay + 10
 	result = appdeploy_exec_run(target, cmd, check=False, timeout=total_timeout)
 
@@ -1621,7 +1697,7 @@ def appdeploy_health_check(
 				timeout=10,
 			)
 			if result.returncode == 0:
-				appdeploy_util_output("Health check passed")
+				appdeploy_util_log_op("Health check passed")
 				return True
 			appdeploy_util_verbose(f"Health check failed, retrying...")
 			import time
@@ -1642,7 +1718,7 @@ def appdeploy_health_check(
 			appdeploy_util_error("Process died during grace period")
 			return False
 
-		appdeploy_util_output("Process still running after grace period")
+		appdeploy_util_log_op("Process still running after grace period")
 		return True
 
 
@@ -1675,14 +1751,13 @@ def appdeploy_cmd_upgrade(
 	if appdeploy_exec_exists(target, f"{run_dir}/.pid"):
 		was_running = True
 
-	appdeploy_util_output(f"Upgrading {pkg.name} to {pkg.version}...")
+	appdeploy_util_log_op(f"Upgrading {pkg.name} to {pkg.version}", version=pkg.version)
 
 	# 1. Install new version
 	appdeploy_target_install(target, pkg, activate=False, keep=keep)
 
 	# 2. Stop current if running
 	if was_running:
-		appdeploy_util_output("Stopping current version...")
 		try:
 			appdeploy_daemon_stop(target, pkg.name, timeout=30, wait=True)
 		except RuntimeError:
@@ -1697,7 +1772,9 @@ def appdeploy_cmd_upgrade(
 	except RuntimeError as e:
 		appdeploy_util_error(f"Failed to start: {e}")
 		if rollback_on_fail and previous_version:
-			appdeploy_util_output(f"Rolling back to {previous_version}...")
+			appdeploy_util_log_op(
+				f"Rolling back to {previous_version}", version=previous_version
+			)
 			appdeploy_target_activate(
 				target, pkg.name, previous_version, no_restart=True
 			)
@@ -1708,17 +1785,21 @@ def appdeploy_cmd_upgrade(
 	# 5. Health check
 	if not appdeploy_health_check(target, pkg.name, health_timeout, startup_grace):
 		if rollback_on_fail and previous_version:
-			appdeploy_util_output(f"Rolling back to {previous_version}...")
+			appdeploy_util_log_op(
+				f"Rolling back to {previous_version}", version=previous_version
+			)
 			appdeploy_daemon_stop(target, pkg.name, force=True)
 			appdeploy_target_activate(
 				target, pkg.name, previous_version, no_restart=True
 			)
 			if was_running:
 				appdeploy_daemon_start(target, pkg.name)
-			appdeploy_util_output(f"Rolled back to {previous_version}")
+			appdeploy_util_log_op(
+				f"Rolled back to {previous_version}", version=previous_version
+			)
 		return False
 
-	appdeploy_util_output(f"Upgrade to {pkg.version} successful")
+	appdeploy_util_log_op(f"Upgrade to {pkg.version} successful", version=pkg.version)
 	return True
 
 
@@ -1739,7 +1820,7 @@ def appdeploy_cmd_rollback(
 
 	was_running = appdeploy_exec_exists(target, f"{run_dir}/.pid")
 
-	appdeploy_util_output(f"Rolling back {name} to {to_version}...")
+	appdeploy_util_log_op(f"Rolling back {name} to {to_version}", version=to_version)
 
 	if was_running:
 		appdeploy_daemon_stop(target, name, force=True)
@@ -1749,7 +1830,7 @@ def appdeploy_cmd_rollback(
 	if was_running and not no_restart:
 		appdeploy_daemon_start(target, name)
 
-	appdeploy_util_output(f"Rolled back to {to_version}")
+	appdeploy_util_log_op(f"Rolled back to {to_version}", version=to_version)
 
 
 def appdeploy_cmd_run_local(
@@ -1896,9 +1977,46 @@ def appdeploy_cmd_run_local(
 # -----------------------------------------------------------------------------
 
 
+class AppDeployArgumentParser(argparse.ArgumentParser):
+	"""ArgumentParser with improved error messages."""
+
+	def error(self, message: str) -> NoReturn:
+		"""Print error with available commands."""
+		self.print_usage(sys.stderr)
+
+		commands = [
+			"check",
+			"package",
+			"run",
+			"install",
+			"uninstall",
+			"activate",
+			"deactivate",
+			"list",
+			"upgrade",
+			"rollback",
+			"clean",
+			"bootstrap",
+			"start",
+			"stop",
+			"restart",
+			"status",
+			"logs",
+			"show",
+			"kill",
+		]
+
+		sys.stderr.write(f"\n{self.prog}: error: {message}\n")
+		sys.stderr.write(f"\nAvailable commands: {', '.join(commands)}\n")
+		sys.stderr.write(
+			f"Run '{self.prog} COMMAND --help' for command-specific help.\n"
+		)
+		sys.exit(2)
+
+
 def appdeploy_build_parser() -> argparse.ArgumentParser:
 	"""Build argument parser with all subcommands."""
-	parser = argparse.ArgumentParser(
+	parser = AppDeployArgumentParser(
 		prog="appdeploy",
 		description="Package, deploy, and manage applications on local/remote targets",
 	)
@@ -1993,7 +2111,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 		"install", help="Upload and unpack archive to target"
 	)
 	p_install.add_argument("package", help="Package path or archive")
-	p_install.add_argument("target", nargs="?", help="Target specification")
 	p_install.add_argument("-n", "--name", help="Override package name")
 	p_install.add_argument("-r", "--release", help="Override package version")
 	p_install.add_argument(
@@ -2009,8 +2126,8 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 
 	# uninstall
 	p_uninstall = subparsers.add_parser("uninstall", help="Remove installed version")
-	p_uninstall.add_argument("package", help="Package name[:version]")
-	p_uninstall.add_argument("target", nargs="?", help="Target specification")
+	p_uninstall.add_argument("package", help="Package name")
+	p_uninstall.add_argument("version", nargs="?", help="Version (or use name:version)")
 	p_uninstall.add_argument("--all", action="store_true", help="Remove all versions")
 	p_uninstall.add_argument(
 		"--keep-data", action="store_true", help="Preserve data/conf"
@@ -2019,8 +2136,8 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 
 	# activate
 	p_activate = subparsers.add_parser("activate", help="Set active version")
-	p_activate.add_argument("package", help="Package name[:version]")
-	p_activate.add_argument("target", nargs="?", help="Target specification")
+	p_activate.add_argument("package", help="Package name")
+	p_activate.add_argument("version", nargs="?", help="Version (or use name:version)")
 	p_activate.add_argument(
 		"--no-restart", action="store_true", help="Don't restart if running"
 	)
@@ -2028,12 +2145,10 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# deactivate
 	p_deactivate = subparsers.add_parser("deactivate", help="Remove active symlinks")
 	p_deactivate.add_argument("package", help="Package name")
-	p_deactivate.add_argument("target", nargs="?", help="Target specification")
 
 	# list
 	p_list = subparsers.add_parser("list", help="List installed packages/versions")
 	p_list.add_argument("package", nargs="?", help="Package name")
-	p_list.add_argument("target", nargs="?", help="Target specification")
 	p_list.add_argument("-l", "--long", action="store_true", help="Detailed output")
 	p_list.add_argument(
 		"--active-only", action="store_true", help="Show only active versions"
@@ -2043,7 +2158,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# upgrade
 	p_upgrade = subparsers.add_parser("upgrade", help="Atomic upgrade with rollback")
 	p_upgrade.add_argument("package", help="Package path or archive")
-	p_upgrade.add_argument("target", nargs="?", help="Target specification")
 	p_upgrade.add_argument("-n", "--name", help="Override package name")
 	p_upgrade.add_argument("-r", "--release", help="Override package version")
 	p_upgrade.add_argument(
@@ -2076,7 +2190,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# rollback
 	p_rollback = subparsers.add_parser("rollback", help="Rollback to previous version")
 	p_rollback.add_argument("package", help="Package name")
-	p_rollback.add_argument("target", nargs="?", help="Target specification")
 	p_rollback.add_argument(
 		"--to", dest="to_version", help="Specific version to rollback to"
 	)
@@ -2087,7 +2200,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# clean
 	p_clean = subparsers.add_parser("clean", help="Remove old inactive versions")
 	p_clean.add_argument("package", help="Package name")
-	p_clean.add_argument("target", nargs="?", help="Target specification")
 	p_clean.add_argument(
 		"--keep",
 		type=int,
@@ -2099,7 +2211,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_bootstrap = subparsers.add_parser(
 		"bootstrap", help="Install/update tools on target"
 	)
-	p_bootstrap.add_argument("target", nargs="?", help="Target specification")
 	p_bootstrap.add_argument(
 		"--check", action="store_true", help="Check only, don't install"
 	)
@@ -2112,8 +2223,7 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 
 	# start
 	p_start = subparsers.add_parser("start", help="Start the active version")
-	p_start.add_argument("package", help="Package name")
-	p_start.add_argument("target", nargs="?", help="Target specification")
+	p_start.add_argument("package", help="Package name[:version]")
 	p_start.add_argument("-a", "--attach", action="store_true", help="Attach to output")
 	p_start.add_argument("-w", "--wait", action="store_true", help="Wait for startup")
 	p_start.add_argument(
@@ -2125,16 +2235,14 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 
 	# stop
 	p_stop = subparsers.add_parser("stop", help="Stop running application")
-	p_stop.add_argument("package", help="Package name")
-	p_stop.add_argument("target", nargs="?", help="Target specification")
+	p_stop.add_argument("package", help="Package name[:version]")
 	p_stop.add_argument("-s", "--signal", default="TERM", help="Signal to send")
 	p_stop.add_argument("-t", "--timeout", type=int, default=30, help="Stop timeout")
 	p_stop.add_argument("-w", "--wait", action="store_true", help="Wait for full exit")
 
 	# restart
 	p_restart = subparsers.add_parser("restart", help="Restart running application")
-	p_restart.add_argument("package", help="Package name")
-	p_restart.add_argument("target", nargs="?", help="Target specification")
+	p_restart.add_argument("package", help="Package name[:version]")
 	p_restart.add_argument(
 		"-w", "--wait", action="store_true", help="Wait for stop before start"
 	)
@@ -2154,7 +2262,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# status
 	p_status = subparsers.add_parser("status", help="Show application status")
 	p_status.add_argument("package", nargs="?", help="Package name")
-	p_status.add_argument("target", nargs="?", help="Target specification")
 	p_status.add_argument("-l", "--long", action="store_true", help="Detailed status")
 	p_status.add_argument(
 		"-w", "--watch", action="store_true", help="Watch continuously"
@@ -2173,7 +2280,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	# logs
 	p_logs = subparsers.add_parser("logs", help="Show application logs")
 	p_logs.add_argument("package", help="Package name")
-	p_logs.add_argument("target", nargs="?", help="Target specification")
 	p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
 	p_logs.add_argument("-n", "--lines", type=int, default=50, help="Number of lines")
 	p_logs.add_argument("--stdout", action="store_true", help="Stdout log only")
@@ -2194,8 +2300,8 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_show = subparsers.add_parser(
 		"show", help="Show package contents and configuration"
 	)
-	p_show.add_argument("package", help="Package name[:version]")
-	p_show.add_argument("target", nargs="?", help="Target specification")
+	p_show.add_argument("package", help="Package name")
+	p_show.add_argument("version", nargs="?", help="Version (or use name:version)")
 	p_show.add_argument("--files", action="store_true", help="List all files")
 	p_show.add_argument("--config", action="store_true", help="Show conf.toml")
 	p_show.add_argument("--env", action="store_true", help="Show env.sh")
@@ -2206,7 +2312,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_kill = subparsers.add_parser("kill", help="Send signal to running application")
 	p_kill.add_argument("package", help="Package name")
 	p_kill.add_argument("signal", nargs="?", default="TERM", help="Signal to send")
-	p_kill.add_argument("target", nargs="?", help="Target specification")
 	p_kill.add_argument(
 		"-a", "--all-processes", action="store_true", help="Send to all processes"
 	)
@@ -2314,12 +2419,12 @@ def appdeploy_cmd_handler_run(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_install(args: argparse.Namespace) -> int:
 	"""Handle 'install' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		# Auto-bootstrap
 		appdeploy_target_bootstrap(target)
@@ -2333,7 +2438,7 @@ def appdeploy_cmd_handler_install(args: argparse.Namespace) -> int:
 			activate=args.activate,
 			keep=args.keep,
 		)
-		appdeploy_util_output(f"Installed {pkg.name}:{pkg.version}")
+		appdeploy_util_log_op(f"Installed {pkg.name}:{pkg.version}")
 		return 0
 	except Exception as e:
 		appdeploy_util_error(str(e))
@@ -2343,16 +2448,24 @@ def appdeploy_cmd_handler_install(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_uninstall(args: argparse.Namespace) -> int:
 	"""Handle 'uninstall' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
+		# Support both "package version" and "package:version" syntax
 		name, version = _parse_package_version(args.package)
+		if args.version:
+			if version:
+				raise ValueError(
+					"Version specified twice (both in package:version and as argument)"
+				)
+			version = args.version
 
-		if not appdeploy_util_confirm(f"Uninstall {args.package}?"):
+		pkg_display = f"{name}:{version}" if version else name
+		if not appdeploy_util_confirm(f"Uninstall {pkg_display}?"):
 			return 3
 
 		appdeploy_target_uninstall(
@@ -2363,7 +2476,7 @@ def appdeploy_cmd_handler_uninstall(args: argparse.Namespace) -> int:
 			keep_data=args.keep_data,
 			keep_logs=args.keep_logs,
 		)
-		appdeploy_util_output(f"Uninstalled {args.package}")
+		appdeploy_util_log_op(f"Uninstalled {pkg_display}")
 		return 0
 	except Exception as e:
 		appdeploy_util_error(str(e))
@@ -2373,14 +2486,21 @@ def appdeploy_cmd_handler_uninstall(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_activate(args: argparse.Namespace) -> int:
 	"""Handle 'activate' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
+		# Support both "package version" and "package:version" syntax
 		name, version = _parse_package_version(args.package)
+		if args.version:
+			if version:
+				raise ValueError(
+					"Version specified twice (both in package:version and as argument)"
+				)
+			version = args.version
 		appdeploy_target_activate(target, name, version, no_restart=args.no_restart)
 		return 0
 	except Exception as e:
@@ -2391,12 +2511,12 @@ def appdeploy_cmd_handler_activate(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_deactivate(args: argparse.Namespace) -> int:
 	"""Handle 'deactivate' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		if not appdeploy_util_confirm(f"Deactivate {args.package}?"):
 			return 3
@@ -2408,43 +2528,19 @@ def appdeploy_cmd_handler_deactivate(args: argparse.Namespace) -> int:
 		return 1
 
 
-def _looks_like_target(value: str) -> bool:
-	"""Check if a string looks like a target specification rather than a package name."""
-	if not value:
-		return False
-	# Contains @ (user@host) or : (host:path) -> likely a target
-	if "@" in value or ":" in value:
-		return True
-	# Starts with path-like prefix -> likely a local target
-	if value.startswith(("/", "~", "./", "../")):
-		return True
-	# Exists as a local directory -> likely a local target
-	if Path(value).is_dir():
-		return True
-	return False
-
-
 def appdeploy_cmd_handler_list(args: argparse.Namespace) -> int:
 	"""Handle 'list' command."""
 	try:
-		package = args.package
-		target_str = args.target
-
-		# If only package is given and it looks like a target, swap them
-		if package and not target_str and _looks_like_target(package):
-			target_str = package
-			package = None
-
-		target_str = target_str or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		versions = appdeploy_target_list(
 			target,
-			name=package,
+			name=args.package,
 			long_format=args.long,
 			active_only=args.active_only,
 			json_format=args.json,
@@ -2487,12 +2583,12 @@ def appdeploy_cmd_handler_list(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_upgrade(args: argparse.Namespace) -> int:
 	"""Handle 'upgrade' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		if not appdeploy_util_confirm(f"Upgrade from {args.package}?"):
 			return 3
@@ -2520,12 +2616,12 @@ def appdeploy_cmd_handler_upgrade(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_rollback(args: argparse.Namespace) -> int:
 	"""Handle 'rollback' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		if not appdeploy_util_confirm(f"Rollback {args.package}?"):
 			return 3
@@ -2545,21 +2641,21 @@ def appdeploy_cmd_handler_rollback(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_clean(args: argparse.Namespace) -> int:
 	"""Handle 'clean' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		if not appdeploy_util_confirm(f"Clean old versions of {args.package}?"):
 			return 3
 
 		removed = appdeploy_target_clean(target, args.package, keep=args.keep)
 		if removed:
-			appdeploy_util_output(f"Removed {len(removed)} old version(s)")
+			appdeploy_util_log_op(f"Removed {len(removed)} old version(s)")
 		else:
-			appdeploy_util_output("Nothing to clean")
+			appdeploy_util_log_op("Nothing to clean")
 		return 0
 	except Exception as e:
 		appdeploy_util_error(str(e))
@@ -2569,12 +2665,12 @@ def appdeploy_cmd_handler_clean(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 	"""Handle 'bootstrap' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		tools_path = Path(args.tools_path) if args.tools_path else None
 
@@ -2583,15 +2679,15 @@ def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 				target, check_only=True, tools_path=tools_path
 			)
 			if ok:
-				appdeploy_util_output("Tools are installed")
+				appdeploy_util_log_op("Tools are installed")
 				return 0
 			else:
-				appdeploy_util_output("Tools are missing or outdated")
+				appdeploy_util_log_op("Tools are missing or outdated")
 				return 1
 
 		ok = appdeploy_target_bootstrap(
 			target,
-			force=args.__dict__.get("_force", False),
+			force=getattr(args, "force", False),
 			upgrade=args.upgrade,
 			tools_path=tools_path,
 		)
@@ -2604,19 +2700,26 @@ def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_start(args: argparse.Namespace) -> int:
 	"""Handle 'start' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
+
+		# Parse package:version and auto-activate if version specified
+		name, version = _parse_package_version(args.package)
 
 		# Auto-bootstrap (ensures tools are up-to-date)
 		appdeploy_target_bootstrap(target)
 
+		# If version specified, ensure it's activated
+		if version:
+			appdeploy_target_activate(target, name, version, no_restart=True)
+
 		appdeploy_daemon_start(
 			target,
-			args.package,
+			name,
 			attach=args.attach,
 			wait=args.wait,
 			timeout=args.start_timeout,
@@ -2631,21 +2734,28 @@ def appdeploy_cmd_handler_start(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_stop(args: argparse.Namespace) -> int:
 	"""Handle 'stop' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
-		if not appdeploy_util_confirm(f"Stop {args.package}?"):
+		# Parse package:version and auto-activate if version specified
+		name, version = _parse_package_version(args.package)
+
+		# If version specified, ensure it's activated first
+		if version:
+			appdeploy_target_activate(target, name, version, no_restart=True)
+
+		if not appdeploy_util_confirm(f"Stop {name}?"):
 			return 3
 
 		appdeploy_daemon_stop(
 			target,
-			args.package,
+			name,
 			signal_name=args.signal,
-			force=args.__dict__.get("_force", False),
+			force=getattr(args, "force", False),
 			timeout=args.timeout,
 			wait=args.wait,
 		)
@@ -2658,20 +2768,27 @@ def appdeploy_cmd_handler_stop(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_restart(args: argparse.Namespace) -> int:
 	"""Handle 'restart' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
-		if not appdeploy_util_confirm(f"Restart {args.package}?"):
+		# Parse package:version and auto-activate if version specified
+		name, version = _parse_package_version(args.package)
+
+		# If version specified, ensure it's activated first
+		if version:
+			appdeploy_target_activate(target, name, version, no_restart=True)
+
+		if not appdeploy_util_confirm(f"Restart {name}?"):
 			return 3
 
 		appdeploy_daemon_restart(
 			target,
-			args.package,
-			force=args.__dict__.get("_force", False),
+			name,
+			force=getattr(args, "force", False),
 			wait=args.wait,
 			stop_timeout=args.stop_timeout,
 			start_timeout=args.start_timeout,
@@ -2687,12 +2804,12 @@ def appdeploy_cmd_handler_restart(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_status(args: argparse.Namespace) -> int:
 	"""Handle 'status' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		if args.watch:
 			import time
@@ -2726,12 +2843,12 @@ def appdeploy_cmd_handler_status(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_logs(args: argparse.Namespace) -> int:
 	"""Handle 'logs' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		stream = "all"
 		if args.stdout:
@@ -2760,14 +2877,21 @@ def appdeploy_cmd_handler_logs(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_show(args: argparse.Namespace) -> int:
 	"""Handle 'show' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
+		# Support both "package version" and "package:version" syntax
 		name, version = _parse_package_version(args.package)
+		if args.version:
+			if version:
+				raise ValueError(
+					"Version specified twice (both in package:version and as argument)"
+				)
+			version = args.version
 
 		if not version:
 			# Get active version
@@ -2833,12 +2957,12 @@ def appdeploy_cmd_handler_show(args: argparse.Namespace) -> int:
 def appdeploy_cmd_handler_kill(args: argparse.Namespace) -> int:
 	"""Handle 'kill' command."""
 	try:
-		target_str = args.target or args.__dict__.get("_target", APPDEPLOY_TARGET)
 		target = appdeploy_target_parse(
-			target_str,
-			force_local=args.__dict__.get("_local", False),
-			force_remote=args.__dict__.get("_remote", False),
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
 		)
+		appdeploy_util_set_log_target(target)
 
 		appdeploy_daemon_kill(
 			target,
@@ -2884,12 +3008,6 @@ def appdeploy_main() -> int:
 	_dry_run = args.dry_run
 	_yes = args.yes
 	_op_timeout = args.op_timeout
-
-	# Store target-related args for handlers
-	args._target = args.target
-	args._local = args.local
-	args._remote = args.remote
-	args._force = args.force
 
 	# No command - show help
 	if not args.command:
