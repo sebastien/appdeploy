@@ -7,7 +7,7 @@ conventions, in `DAEMONCTL_PATH`:
 ${APP_NAME}/
   run/
     [conf.toml]             # Optional configuration
-    [env.sh]                # Optional environment script, sourced before running any other
+    [env.sh]                # Optional environment script (sourced by run.sh, not automatically)
     run[.sh]                # Runs the application in the foreground
     [check[.sh]]            # Health check to run
     [on-start[.sh]]         # Script run when the application is working and started
@@ -135,6 +135,31 @@ Run application as daemon (combines start + attach):
 --env KEY=VALUE              # Set environment variable (repeatable)
 --env-file FILE              # Load environment from file
 --clear-env                  # Clear inherited environment
+```
+
+### Provided Environment Variables
+
+The following environment variables are automatically set by daemonctl before running
+the application:
+
+| Variable | Description |
+|----------|-------------|
+| `APPDEPLOY_APP_PATH` | Absolute path to app directory (e.g., `/opt/apps/myapp`) |
+| `APPDEPLOY_APP_NAME` | Application name (e.g., `myapp`) |
+| `APPDEPLOY_APP_VERSION` | Version from `run/.version` if present, otherwise empty |
+
+### Sourcing env.sh
+
+If your application needs environment customization via `env.sh`, source it explicitly
+in `run.sh`:
+
+```bash
+#!/bin/bash
+# Source environment if available
+[[ -f "$APPDEPLOY_APP_PATH/run/env.sh" ]] && source "$APPDEPLOY_APP_PATH/run/env.sh"
+
+# Rest of run.sh...
+exec myapp --config "$APPDEPLOY_APP_PATH/config.yaml"
 ```
 
 ## Command: `daemonctl start [OPTIONS] APP_NAME`

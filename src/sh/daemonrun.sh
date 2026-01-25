@@ -1829,24 +1829,8 @@ $ulimit_cmds
 
 rm -f "$daemon_script"
 
-# Run command and capture exit status
-$quoted_cmd
-exit_code=\$?
-
-# Report signal-based crashes
-if [[ \$exit_code -gt 128 ]]; then
-    sig=\$((exit_code - 128))
-    case \$sig in
-        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
-        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
-        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
-        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
-        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
-    esac
-    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
-fi
-
-exit \$exit_code
+# Replace shell with the command (ensures PID in pidfile is the actual process)
+exec $quoted_cmd
 EOF
     elif [[ -n "$stderr_file" ]]; then
         # Both stdout and stderr configured
@@ -1862,24 +1846,8 @@ $ulimit_cmds
 
 rm -f "$daemon_script"
 
-# Run command and capture exit status
-$quoted_cmd
-exit_code=\$?
-
-# Report signal-based crashes
-if [[ \$exit_code -gt 128 ]]; then
-    sig=\$((exit_code - 128))
-    case \$sig in
-        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
-        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
-        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
-        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
-        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
-    esac
-    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
-fi
-
-exit \$exit_code
+# Replace shell with the command (ensures PID in pidfile is the actual process)
+exec $quoted_cmd
 EOF
     else
         # Only stdout configured - stderr follows stdout
@@ -1895,24 +1863,8 @@ $ulimit_cmds
 
 rm -f "$daemon_script"
 
-# Run command and capture exit status
-$quoted_cmd
-exit_code=\$?
-
-# Report signal-based crashes
-if [[ \$exit_code -gt 128 ]]; then
-    sig=\$((exit_code - 128))
-    case \$sig in
-        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
-        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
-        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
-        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
-        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
-    esac
-    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
-fi
-
-exit \$exit_code
+# Replace shell with the command (ensures PID in pidfile is the actual process)
+exec $quoted_cmd
 EOF
     fi
     chmod +x "$daemon_script"

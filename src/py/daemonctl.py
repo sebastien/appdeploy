@@ -237,7 +237,8 @@ def daemonctl_util_log(level: str, msg: str) -> None:
 	color = {"debug": "dim", "info": "", "warn": "yellow", "error": "red"}.get(
 		level, ""
 	)
-	line = f"{prefix} {msg}"
+	timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+	line = f"{timestamp} [daemonctl] {prefix} {msg}"
 	if color:
 		line = daemonctl_util_color(line, color)
 	print(line, file=sys.stderr if level == "error" else sys.stdout)
@@ -1279,42 +1280,6 @@ def daemonctl_app_get_run_dir(app_name: str) -> Path:
 	return daemonctl_app_path(app_name)
 
 
-# Function: daemonctl_app_source_env APP_NAME
-# Source env.sh and return environment variables.
-def daemonctl_app_source_env(app_name: str) -> dict[str, str]:
-	"""Source env.sh and return resulting environment variables."""
-	# Look for env.sh in the same directory as run.sh
-	run_dir = daemonctl_app_get_run_dir(app_name)
-	env_script = run_dir / "env.sh"
-	if not env_script.exists():
-		# Fall back to app root
-		env_script = daemonctl_app_path(app_name) / "env.sh"
-		if not env_script.exists():
-			return {}
-
-	# Source the script and dump environment
-	# Run from the run directory so relative paths work correctly
-	cmd = f"set -a; source {env_script} >/dev/null 2>&1; env"
-	try:
-		result = subprocess.run(
-			["bash", "-c", cmd],
-			capture_output=True,
-			text=True,
-			timeout=5,
-			cwd=str(run_dir),
-		)
-		if result.returncode != 0:
-			return {}
-		env = {}
-		for line in result.stdout.splitlines():
-			if "=" in line:
-				key, _, value = line.partition("=")
-				env[key] = value
-		return env
-	except Exception:
-		return {}
-
-
 # Function: daemonctl_app_run_hook APP_NAME HOOK
 # Run on-start or on-stop hook.
 def daemonctl_app_run_hook(app_name: str, hook: str) -> int:
@@ -1437,9 +1402,15 @@ def daemonctl_app_start_with_teelog(
 		+ run_cmd
 	)
 
-	# Source environment
+	# Set appdeploy environment variables
 	env = os.environ.copy()
-	env.update(daemonctl_app_source_env(app_name))
+	app_path = daemonctl_app_path(app_name)
+	env["APPDEPLOY_APP_PATH"] = str(app_path)
+	env["APPDEPLOY_APP_NAME"] = app_name
+	version_file = app_path / "run" / ".version"
+	env["APPDEPLOY_APP_VERSION"] = (
+		version_file.read_text().strip() if version_file.exists() else ""
+	)
 	env.update(config.process.environment)
 
 	return cmd, env
@@ -1455,9 +1426,15 @@ def daemonctl_supervisor_run(app_name: str, config: AppConfig) -> int:
 	daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 	run_cmd = daemonctl_app_get_run_cmd(app_name)
 
-	# Source environment
+	# Set appdeploy environment variables
 	env = os.environ.copy()
-	env.update(daemonctl_app_source_env(app_name))
+	app_path = daemonctl_app_path(app_name)
+	env["APPDEPLOY_APP_PATH"] = str(app_path)
+	env["APPDEPLOY_APP_NAME"] = app_name
+	version_file = app_path / "run" / ".version"
+	env["APPDEPLOY_APP_VERSION"] = (
+		version_file.read_text().strip() if version_file.exists() else ""
+	)
 	env.update(config.process.environment)
 
 	# Supervisor state
@@ -1841,9 +1818,15 @@ def daemonctl_cmd_run(args: argparse.Namespace) -> int:
 	daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 	run_cmd = daemonctl_app_get_run_cmd(app_name)
 
-	# Source environment
+	# Set appdeploy environment variables
 	env = os.environ.copy()
-	env.update(daemonctl_app_source_env(app_name))
+	app_path = daemonctl_app_path(app_name)
+	env["APPDEPLOY_APP_PATH"] = str(app_path)
+	env["APPDEPLOY_APP_NAME"] = app_name
+	version_file = app_path / "run" / ".version"
+	env["APPDEPLOY_APP_VERSION"] = (
+		version_file.read_text().strip() if version_file.exists() else ""
+	)
 	env.update(config.process.environment)
 	# Apply CLI --env options
 	for env_kv in getattr(args, "env", None) or []:
@@ -1903,9 +1886,15 @@ def daemonctl_cmd_start(args: argparse.Namespace) -> int:
 		run_cmd = daemonctl_app_get_run_cmd(app_name)
 		cmd = [DAEMONRUN_CMD, "--daemon"] + daemonrun_args + ["--"] + run_cmd
 
-		# Source environment
+		# Set appdeploy environment variables
 		env = os.environ.copy()
-		env.update(daemonctl_app_source_env(app_name))
+		app_path = daemonctl_app_path(app_name)
+		env["APPDEPLOY_APP_PATH"] = str(app_path)
+		env["APPDEPLOY_APP_NAME"] = app_name
+		version_file = app_path / "run" / ".version"
+		env["APPDEPLOY_APP_VERSION"] = (
+			version_file.read_text().strip() if version_file.exists() else ""
+		)
 		env.update(config.process.environment)
 
 	# Apply CLI --env options
@@ -1982,7 +1971,13 @@ def daemonctl_cmd_stop(args: argparse.Namespace) -> int:
 	else:
 		sig_num = signal.SIGTERM
 
-	daemonctl_process_signal(PID, sig_num)
+	# Send signal to process group to ensure all child processes are terminated
+	daemonctl_util_log("info", f"Sending signal to process group")
+	try:
+		os.killpg(os.getpgid(PID), sig_num)
+	except (OSError, ProcessLookupError):
+		# Fallback to single process if process group fails
+		daemonctl_process_signal(PID, sig_num)
 
 	# Wait for exit
 	if daemonctl_process_wait(PID, timeout):
@@ -1992,8 +1987,13 @@ def daemonctl_cmd_stop(args: argparse.Namespace) -> int:
 
 	# Force kill if requested
 	if force:
-		daemonctl_util_log("warn", "Graceful stop timed out, sending SIGKILL")
-		daemonctl_process_signal(PID, signal.SIGKILL)
+		daemonctl_util_log(
+			"warn", "Graceful stop timed out, sending SIGKILL to process group"
+		)
+		try:
+			os.killpg(os.getpgid(PID), signal.SIGKILL)
+		except (OSError, ProcessLookupError):
+			daemonctl_process_signal(PID, signal.SIGKILL)
 		time.sleep(0.5)
 		if not daemonctl_process_is_running(PID):
 			daemonctl_app_run_hook(app_name, "on-stop")
