@@ -1,7 +1,5 @@
-REQUIRE_BIN=pandoc shellcheck
-
 .PHONY: all
-all: test test docs
+all: test docs
 	@
 
 .PHONY: test
@@ -30,13 +28,21 @@ define sh-install
 	echo "-> Installed $2 $$PREFIX/share/man/man1/appdeploy.1"
 endef
 
-.PHONY: install-link
-install-link: dist/docs/appdeploy.1
+.PHONY: install-appdeploy-link
+install-appdeploy-link: dist/docs/appdeploy.1
 	@$(call sh-install,ln -sfr,(link))
 
 .PHONY: install
 install: dist/docs/appdeploy.1
 	@$(call sh-install,cp -a,(copy))
+
+.PHONY: install-symlink
+install-symlink:
+	@mkdir -p ~/.local/bin
+	@for file in bin/*; do \
+		ln -sfr "$$file" ~/.local/bin/; \
+		echo "-> Symlinked $$file to ~/.local/bin/$$(basename $$file)"; \
+	done
 
 .PHONY: docs
 docs: dist/docs/manual.html dist/docs/appdeploy.1
@@ -48,11 +54,11 @@ compile: dist/appdeploy
 
 dist/appdeploy: $(wildcard src/sh/*.sh)
 	@mkdir -p $(dir $@)
-	mkdir -p build
-	for file in $^; do cp -a "$$file" build; done;
+	@mkdir -p build
+	@for file in $^; do cp -a "$$file" build; done;
 	echo "#!$$(which bash)" > "build/$(notdir $<)"
 	tail -n +2 "$<" >> "build/$(notdir $<)"
-	if which shc 2> /dev/null; then \
+	if command -v shc >/dev/null 2>&1; then \
 		shc -U -f "build/$(notdir $<)" -o "$@"; \
 	else \
 		echo "... shc not found, copying shell script directly"; \
@@ -62,19 +68,20 @@ dist/appdeploy: $(wildcard src/sh/*.sh)
 
 dist/docs/manual.html: docs/manual.md docs/template.html
 	@mkdir -p $(dir $@)
-	if ! which pandoc 2> /dev/null; then
+	if ! command -v pandoc >/dev/null 2>&1; then
 		echo "!!! ERR Cannot find 'pandoc'"
 		exit 1
 	fi
 	# Generate HTML content and insert into template
-	pandoc docs/manual.md --toc -o temp_body.html
+	mkdir -p build
+	pandoc docs/manual.md --toc -o build/temp_body.html
 	# Create final HTML by replacing placeholder in template
-	awk 'BEGIN{print ""} /\$$body\$$/ {system("cat temp_body.html"); next} 1' docs/template.html > "$@"
-	rm temp_body.html
+	awk 'BEGIN{print ""} /\$$body\$$/ {system("cat build/temp_body.html"); next} 1' docs/template.html > "$@"
+	rm build/temp_body.html
 
 dist/docs/appdeploy.1: docs/manual.md
 	@mkdir -p "$(dir $@)"
-	if ! which pandoc 2> /dev/null; then
+	if ! command -v pandoc >/dev/null 2>&1; then
 		echo "!!! ERR Cannot find 'pandoc'"
 		exit 1
 	fi
@@ -86,7 +93,7 @@ dist: dist/appdeploy dist/docs/manual.html dist/docs/appdeploy.1
 
 .PHONY: check
 check:
-	@if ! which shellcheck >/dev/null 2>&1; then \
+	@if ! command -v shellcheck >/dev/null 2>&1; then \
 		echo "!!! ERR Cannot find 'shellcheck'"; \
 		exit 1; \
 	fi

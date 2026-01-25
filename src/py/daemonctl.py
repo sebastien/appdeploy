@@ -48,16 +48,19 @@ DAEMONCTL_NO_COLOR = os.environ.get("DAEMONCTL_NO_COLOR", "") == "1"
 
 # Tool paths - look in same directory as this script first
 _SCRIPT_DIR = Path(__file__).parent.resolve()
-DAEMONRUN_CMD = (
-	str(_SCRIPT_DIR / "daemonrun.sh")
-	if (_SCRIPT_DIR / "daemonrun.sh").exists()
-	else "daemonrun.sh"
-)
-TEELOG_CMD = (
-	str(_SCRIPT_DIR / "teelog.sh")
-	if (_SCRIPT_DIR / "teelog.sh").exists()
-	else "teelog.sh"
-)
+
+
+def _find_tool(names: list[str], fallback: str) -> str:
+	"""Find tool in script directory, trying multiple names."""
+	for name in names:
+		path = _SCRIPT_DIR / name
+		if path.exists():
+			return str(path)
+	return fallback
+
+
+DAEMONRUN_CMD = _find_tool(["daemonrun", "daemonrun.sh"], "daemonrun")
+TEELOG_CMD = _find_tool(["teelog", "teelog.sh"], "teelog")
 
 # Global runtime state
 _verbose = False
@@ -572,9 +575,11 @@ def daemonctl_config_from_env(app_name: str, config: AppConfig) -> AppConfig:
 	return config
 
 
-# Function: daemonctl_config_to_daemonrun_args CONFIG
+# Function: daemonctl_config_to_daemonrun_args CONFIG APP_NAME
 # Convert AppConfig to daemonrun CLI arguments.
-def daemonctl_config_to_daemonrun_args(config: AppConfig) -> list[str]:
+def daemonctl_config_to_daemonrun_args(
+	config: AppConfig, app_name: str = ""
+) -> list[str]:
 	"""Convert config to daemonrun command-line arguments."""
 	args = []
 
@@ -585,8 +590,13 @@ def daemonctl_config_to_daemonrun_args(config: AppConfig) -> list[str]:
 		args.append("--foreground")
 	if not config.daemon.setsid:
 		args.append("--no-setsid")
+	# Set working directory: explicit config, or default to run script directory
 	if config.daemon.working_directory:
 		args.extend(["--chdir", config.daemon.working_directory])
+	elif app_name:
+		# Default to the directory containing run.sh so relative paths work
+		run_dir = daemonctl_app_get_run_dir(app_name)
+		args.extend(["--chdir", str(run_dir)])
 	if config.daemon.umask and config.daemon.umask != "022":
 		args.extend(["--umask", config.daemon.umask])
 
@@ -606,15 +616,21 @@ def daemonctl_config_to_daemonrun_args(config: AppConfig) -> list[str]:
 	if config.security.capabilities_keep:
 		args.extend(["--caps-keep", ",".join(config.security.capabilities_keep)])
 
-	# Logging settings
+	# Logging settings - always specify stdout/stderr to avoid /dev/null
 	if config.logging.file:
 		args.extend(["--log", config.logging.file])
 	if config.logging.level and config.logging.level != "info":
 		args.extend(["--log-level", config.logging.level])
-	if config.logging.stdout_file:
-		args.extend(["--stdout", config.logging.stdout_file])
-	if config.logging.stderr_file:
-		args.extend(["--stderr", config.logging.stderr_file])
+
+	# Determine app path for default log locations
+	log_name = config.daemon.name or app_name or "daemon"
+	app_path = daemonctl_app_path(app_name) if app_name else Path(".")
+
+	stdout_file = config.logging.stdout_file or str(app_path / f"{log_name}.log")
+	stderr_file = config.logging.stderr_file or str(app_path / f"{log_name}.err")
+	args.extend(["--stdout", stdout_file])
+	args.extend(["--stderr", stderr_file])
+
 	if config.logging.syslog:
 		args.append("--syslog")
 	if config.logging.quiet:
@@ -1253,15 +1269,31 @@ def daemonctl_app_status(app_name: str) -> dict:
 	return status
 
 
+# Function: daemonctl_app_get_run_dir APP_NAME
+# Get the directory containing the run script (for env.sh sourcing and working directory).
+def daemonctl_app_get_run_dir(app_name: str) -> Path:
+	"""Get the directory containing the run script."""
+	run_script = daemonctl_app_get_run_script(app_name)
+	if run_script:
+		return run_script.parent
+	return daemonctl_app_path(app_name)
+
+
 # Function: daemonctl_app_source_env APP_NAME
 # Source env.sh and return environment variables.
 def daemonctl_app_source_env(app_name: str) -> dict[str, str]:
 	"""Source env.sh and return resulting environment variables."""
-	env_script = daemonctl_app_path(app_name) / "env.sh"
+	# Look for env.sh in the same directory as run.sh
+	run_dir = daemonctl_app_get_run_dir(app_name)
+	env_script = run_dir / "env.sh"
 	if not env_script.exists():
-		return {}
+		# Fall back to app root
+		env_script = daemonctl_app_path(app_name) / "env.sh"
+		if not env_script.exists():
+			return {}
 
 	# Source the script and dump environment
+	# Run from the run directory so relative paths work correctly
 	cmd = f"set -a; source {env_script} >/dev/null 2>&1; env"
 	try:
 		result = subprocess.run(
@@ -1269,7 +1301,7 @@ def daemonctl_app_source_env(app_name: str) -> dict[str, str]:
 			capture_output=True,
 			text=True,
 			timeout=5,
-			cwd=str(daemonctl_app_path(app_name)),
+			cwd=str(run_dir),
 		)
 		if result.returncode != 0:
 			return {}
@@ -1391,7 +1423,7 @@ def daemonctl_app_start_with_teelog(
 	teelog_cmd = daemonctl_app_build_teelog_cmd(config)
 
 	# Build daemonrun command
-	daemonrun_args = daemonctl_config_to_daemonrun_args(config)
+	daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 	run_cmd = daemonctl_app_get_run_cmd(app_name)
 
 	# Combine: teelog ... -- daemonrun ... -- ./run
@@ -1420,7 +1452,7 @@ def daemonctl_supervisor_run(app_name: str, config: AppConfig) -> int:
 	daemonctl_util_log("info", f"Starting supervisor for {app_name}")
 
 	# Build command
-	daemonrun_args = daemonctl_config_to_daemonrun_args(config)
+	daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 	run_cmd = daemonctl_app_get_run_cmd(app_name)
 
 	# Source environment
@@ -1806,7 +1838,7 @@ def daemonctl_cmd_run(args: argparse.Namespace) -> int:
 		return daemonctl_supervisor_run(app_name, config)
 
 	# Simple foreground mode without supervisor
-	daemonrun_args = daemonctl_config_to_daemonrun_args(config)
+	daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 	run_cmd = daemonctl_app_get_run_cmd(app_name)
 
 	# Source environment
@@ -1858,12 +1890,16 @@ def daemonctl_cmd_start(args: argparse.Namespace) -> int:
 	# Apply CLI overrides
 	config = daemonctl_config_apply_CLI_overrides(args, config)
 
+	# Apply verbose flag from CLI
+	if getattr(args, "verbose", False):
+		config.logging.verbose = True
+
 	# Check if teelog is needed for log rotation
 	if daemonctl_app_needs_teelog(config):
 		cmd, env = daemonctl_app_start_with_teelog(app_name, config, foreground=False)
 	else:
 		# Build daemonrun command directly
-		daemonrun_args = daemonctl_config_to_daemonrun_args(config)
+		daemonrun_args = daemonctl_config_to_daemonrun_args(config, app_name)
 		run_cmd = daemonctl_app_get_run_cmd(app_name)
 		cmd = [DAEMONRUN_CMD, "--daemon"] + daemonrun_args + ["--"] + run_cmd
 
@@ -2530,6 +2566,9 @@ def daemonctl_CLI_build_parser() -> argparse.ArgumentParser:
 		"-a", "--attach", action="store_true", help="Attach after starting"
 	)
 	p_start.add_argument("-w", "--wait", action="store_true", help="Wait for startup")
+	p_start.add_argument(
+		"-V", "--verbose", action="store_true", help="Verbose startup output"
+	)
 	# Add extended options to start
 	daemonctl_CLI_add_process_options(p_start)
 
@@ -2552,6 +2591,9 @@ def daemonctl_CLI_build_parser() -> argparse.ArgumentParser:
 		"-f", "--force", action="store_true", help="Force stop if needed"
 	)
 	p_restart.add_argument("-w", "--wait", action="store_true", help="Wait for restart")
+	p_restart.add_argument(
+		"-V", "--verbose", action="store_true", help="Verbose startup output"
+	)
 
 	# status command
 	p_status = subparsers.add_parser("status", help="Show app status")

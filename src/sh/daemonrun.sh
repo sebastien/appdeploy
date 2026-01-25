@@ -1792,67 +1792,127 @@ daemonrun_run_daemon() {
     fi
 
     # Determine stdout/stderr destinations
-    local stdout_file="${_DAEMONRUN_STDOUT_FILE:-/dev/null}"
-    local stderr_file="${_DAEMONRUN_STDERR_FILE:-/dev/null}"
+    # Default to a log file in current directory, never /dev/null
+    local default_log="./${_DAEMONRUN_GROUP:-daemon}.log"
+
+    local stdout_file="${_DAEMONRUN_STDOUT_FILE:-$default_log}"
+    local stderr_file="${_DAEMONRUN_STDERR_FILE:-}"
     local use_syslog="$_DAEMONRUN_SYSLOG"
 
     # Quote the command for passing to bash -c
     local quoted_cmd
     quoted_cmd=$(printf '%q ' "${cmd[@]}")
 
+    # Build ulimit commands (shared across all branches)
+    local ulimit_cmds=""
+    [[ -n "$mem_limit_kb" ]] && ulimit_cmds+="ulimit -v $mem_limit_kb 2>/dev/null || true"$'\n'
+    [[ -n "$_DAEMONRUN_LIMIT_FILES" ]] && ulimit_cmds+="ulimit -n $_DAEMONRUN_LIMIT_FILES 2>/dev/null || true"$'\n'
+    [[ -n "$_DAEMONRUN_LIMIT_PROCS" ]] && ulimit_cmds+="ulimit -u $_DAEMONRUN_LIMIT_PROCS 2>/dev/null || true"$'\n'
+    [[ -n "$core_limit_kb" ]] && ulimit_cmds+="ulimit -c $core_limit_kb 2>/dev/null || true"$'\n'
+    [[ -n "$stack_limit_kb" ]] && ulimit_cmds+="ulimit -s $stack_limit_kb 2>/dev/null || true"$'\n'
+
     # Create a temporary daemon script
     local daemon_script
     daemon_script=$(mktemp)
 
-    if [[ "$use_syslog" == true ]] && [[ "$stdout_file" == "/dev/null" ]] && [[ "$stderr_file" == "/dev/null" ]]; then
-        # Use logger for syslog output
+    if [[ "$use_syslog" == true ]] && [[ -z "$_DAEMONRUN_STDOUT_FILE" ]] && [[ -z "$_DAEMONRUN_STDERR_FILE" ]]; then
+        # Use logger for syslog output, but also write to log file
         cat > "$daemon_script" <<EOF
 #!/bin/bash
-# Redirect file descriptors through logger
 exec 0</dev/null
-exec 1> >(logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.info)
-exec 2> >(logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.err)
+exec 1> >(tee -a "$stdout_file" | logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.info)
+exec 2> >(tee -a "$stdout_file" | logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.err)
 
-# Write our PID to pidfile
 echo \$\$ > "$pidfile"
 
-# Apply resource limits
-${mem_limit_kb:+ulimit -v "$mem_limit_kb" 2>/dev/null || true}
-${_DAEMONRUN_LIMIT_FILES:+ulimit -n "$_DAEMONRUN_LIMIT_FILES" 2>/dev/null || true}
-${_DAEMONRUN_LIMIT_PROCS:+ulimit -u "$_DAEMONRUN_LIMIT_PROCS" 2>/dev/null || true}
-${core_limit_kb:+ulimit -c "$core_limit_kb" 2>/dev/null || true}
-${stack_limit_kb:+ulimit -s "$stack_limit_kb" 2>/dev/null || true}
+$ulimit_cmds
 
-# Remove this script
 rm -f "$daemon_script"
 
-# Execute the command
-exec $quoted_cmd
+# Run command and capture exit status
+$quoted_cmd
+exit_code=\$?
+
+# Report signal-based crashes
+if [[ \$exit_code -gt 128 ]]; then
+    sig=\$((exit_code - 128))
+    case \$sig in
+        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
+        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
+        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
+        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
+        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
+    esac
+    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
+fi
+
+exit \$exit_code
 EOF
-    else
-        # Standard file-based output
+    elif [[ -n "$stderr_file" ]]; then
+        # Both stdout and stderr configured
         cat > "$daemon_script" <<EOF
 #!/bin/bash
-# Redirect file descriptors
 exec 0</dev/null
 exec 1>>"$stdout_file"
 exec 2>>"$stderr_file"
 
-# Write our PID to pidfile
 echo \$\$ > "$pidfile"
 
-# Apply resource limits
-${mem_limit_kb:+ulimit -v "$mem_limit_kb" 2>/dev/null || true}
-${_DAEMONRUN_LIMIT_FILES:+ulimit -n "$_DAEMONRUN_LIMIT_FILES" 2>/dev/null || true}
-${_DAEMONRUN_LIMIT_PROCS:+ulimit -u "$_DAEMONRUN_LIMIT_PROCS" 2>/dev/null || true}
-${core_limit_kb:+ulimit -c "$core_limit_kb" 2>/dev/null || true}
-${stack_limit_kb:+ulimit -s "$stack_limit_kb" 2>/dev/null || true}
+$ulimit_cmds
 
-# Remove this script
 rm -f "$daemon_script"
 
-# Execute the command
-exec $quoted_cmd
+# Run command and capture exit status
+$quoted_cmd
+exit_code=\$?
+
+# Report signal-based crashes
+if [[ \$exit_code -gt 128 ]]; then
+    sig=\$((exit_code - 128))
+    case \$sig in
+        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
+        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
+        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
+        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
+        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
+    esac
+    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
+fi
+
+exit \$exit_code
+EOF
+    else
+        # Only stdout configured - stderr follows stdout
+        cat > "$daemon_script" <<EOF
+#!/bin/bash
+exec 0</dev/null
+exec 1>>"$stdout_file"
+exec 2>&1
+
+echo \$\$ > "$pidfile"
+
+$ulimit_cmds
+
+rm -f "$daemon_script"
+
+# Run command and capture exit status
+$quoted_cmd
+exit_code=\$?
+
+# Report signal-based crashes
+if [[ \$exit_code -gt 128 ]]; then
+    sig=\$((exit_code - 128))
+    case \$sig in
+        1) sig_name="SIGHUP" ;; 2) sig_name="SIGINT" ;; 3) sig_name="SIGQUIT" ;;
+        4) sig_name="SIGILL (Illegal instruction)" ;; 6) sig_name="SIGABRT" ;;
+        8) sig_name="SIGFPE" ;; 9) sig_name="SIGKILL" ;;
+        11) sig_name="SIGSEGV (Segmentation fault)" ;; 13) sig_name="SIGPIPE" ;;
+        15) sig_name="SIGTERM" ;; *) sig_name="signal \$sig" ;;
+    esac
+    echo "Process killed by \$sig_name (exit code \$exit_code)" >&2
+fi
+
+exit \$exit_code
 EOF
     fi
     chmod +x "$daemon_script"
@@ -1879,6 +1939,22 @@ EOF
     # Clean up script if still exists (in case daemon failed)
     rm -f "$daemon_script" 2>/dev/null || true
 
+    # Helper to display startup failure logs
+    _show_startup_logs() {
+        # Small delay to let any final output be flushed
+        sleep 0.1
+        sync 2>/dev/null || true
+        # Show stdout first, then stderr
+        if [[ -s "$stdout_file" ]]; then
+            echo "# out: $stdout_file" >&2
+            cat "$stdout_file" >&2
+        fi
+        if [[ -n "$stderr_file" && -s "$stderr_file" ]]; then
+            echo "# err: $stderr_file" >&2
+            cat "$stderr_file" >&2
+        fi
+    }
+
     # Check if PID file was created
     if [[ -f "$pidfile" ]]; then
         local daemon_pid
@@ -1887,10 +1963,12 @@ EOF
             daemonrun_log_info "Daemon started (PID: $daemon_pid, pidfile: $pidfile)"
         else
             daemonrun_log_error "Daemon process exited immediately"
+            _show_startup_logs
             exit 1
         fi
     else
         daemonrun_log_error "Daemon may have failed to start (no PID file)"
+        _show_startup_logs
         exit 1
     fi
 
