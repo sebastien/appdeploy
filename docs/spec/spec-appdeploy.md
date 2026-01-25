@@ -19,7 +19,7 @@ An application package directory contains:
 
 ```
 [conf.toml]             # Optional package and daemon configuration
-[env.sh]                # Optional environment script, sourced before any other
+[env.sh]                # Optional environment script (sourced by run.sh, not automatically)
 run[.sh]                # Required: runs the application in foreground
 [check[.sh]]            # Optional health check script
 [on-start[.sh]]         # Script run when application starts successfully
@@ -269,9 +269,34 @@ On extraction to target:
 |------|---------------|-------|
 | `run` / `run.sh` | executable (0755) | Validated by `check` |
 | `check.sh` | executable (0755) | If present |
-| `env.sh` | readable (0644+) | Sourced, not executed |
+| `env.sh` | readable (0644+) | Sourced by run.sh (convention) |
 | `on-start.sh` | executable (0755) | If present |
 | `on-stop.sh` | executable (0755) | If present |
+
+### Environment Variables
+
+The following environment variables are automatically set by daemonctl/appdeploy
+before running the application:
+
+| Variable | Description |
+|----------|-------------|
+| `APPDEPLOY_APP_PATH` | Absolute path to app directory (e.g., `/opt/apps/myapp`) |
+| `APPDEPLOY_APP_NAME` | Application name (e.g., `myapp`) |
+| `APPDEPLOY_APP_VERSION` | Version from `run/.version` if present, otherwise empty |
+
+### Sourcing env.sh
+
+If your application needs environment customization via `env.sh`, source it explicitly
+in `run.sh`:
+
+```bash
+#!/bin/bash
+# Source environment if available
+[[ -f "$APPDEPLOY_APP_PATH/run/env.sh" ]] && source "$APPDEPLOY_APP_PATH/run/env.sh"
+
+# Rest of run.sh...
+exec myapp --config "$APPDEPLOY_APP_PATH/config.yaml"
+```
 
 ## CLI Reference
 
@@ -779,7 +804,6 @@ Shows package contents and configuration.
 ```
 --files                      # List all files in version
 --config                     # Show resolved conf.toml
---env                        # Show env.sh contents
 --run                        # Show run script contents
 --tree                       # Show directory tree
 ```

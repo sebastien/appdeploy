@@ -20,6 +20,7 @@
 # >   [VERSION]       - Optional version file
 
 import argparse
+import contextlib
 import dataclasses
 import fnmatch
 import hashlib
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import tomllib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -68,6 +70,7 @@ _op_timeout = APPDEPLOY_OP_TIMEOUT
 # Logging context for consistent output format
 _log_target: Optional[str] = None  # Current target string for logging
 _log_first_op = True  # Whether next operation is the first (shows time)
+_log_first_ssh = True  # Whether next SSH command is the first (shows connecting status)
 
 # -----------------------------------------------------------------------------
 #
@@ -160,9 +163,49 @@ def appdeploy_util_warn(message: str) -> None:
 	print(f"{color}warning:{reset} {message}", file=sys.stderr)
 
 
+def appdeploy_util_status(message: str) -> None:
+	"""Print status message for ongoing operations.
+
+	Used for transient status updates during slow operations.
+	Respects --quiet flag.
+	"""
+	if _quiet:
+		return
+
+	parts = []
+	if _log_target:
+		parts.append(f"[{_log_target}]")
+	parts.append(message)
+	print(" ".join(parts))
+
+
+@contextlib.contextmanager
+def appdeploy_util_delayed_status(message: str, delay: float = 1.0):
+	"""Context manager that shows status message only if operation takes longer than delay.
+
+	Args:
+		message: Status message to display (with trailing ... added automatically)
+		delay: Seconds to wait before showing message (default 1.0)
+	"""
+	timer = None
+
+	def show_status():
+		appdeploy_util_status(f"{message}...")
+
+	if not _quiet:
+		timer = threading.Timer(delay, show_status)
+		timer.start()
+
+	try:
+		yield
+	finally:
+		if timer:
+			timer.cancel()
+
+
 def appdeploy_util_set_log_target(target: "Target") -> None:
 	"""Set the current target for logging context."""
-	global _log_target, _log_first_op
+	global _log_target, _log_first_op, _log_first_ssh
 	if target.is_remote:
 		if target.user:
 			_log_target = f"{target.user}@{target.host}:{target.path}"
@@ -171,6 +214,7 @@ def appdeploy_util_set_log_target(target: "Target") -> None:
 	else:
 		_log_target = str(target.path)
 	_log_first_op = True
+	_log_first_ssh = True
 
 
 def appdeploy_util_log_op(message: str, version: Optional[str] = None) -> None:
@@ -282,6 +326,25 @@ def appdeploy_util_format_duration(seconds: float) -> str:
 		return f"{seconds / 60:.1f}m"
 	else:
 		return f"{seconds / 3600:.1f}h"
+
+
+def appdeploy_util_format_time_ago(timestamp: float) -> str:
+	"""Format a timestamp as a relative time string (e.g., '2m ago', '1h ago')."""
+	import time
+
+	now = time.time()
+	diff = now - timestamp
+
+	if diff < 0:
+		return "future"
+	elif diff < 60:
+		return f"{int(diff)}s ago"
+	elif diff < 3600:
+		return f"{int(diff / 60)}m ago"
+	elif diff < 86400:
+		return f"{int(diff / 3600)}h ago"
+	else:
+		return f"{int(diff / 86400)}d ago"
 
 
 # -----------------------------------------------------------------------------
@@ -398,6 +461,8 @@ def appdeploy_exec_run(
 	capture: bool = True,
 ) -> subprocess.CompletedProcess:
 	"""Execute command on target (SSH for remote, direct for local)."""
+	global _log_first_ssh
+
 	if timeout is None:
 		timeout = _op_timeout
 
@@ -413,9 +478,26 @@ def appdeploy_exec_run(
 
 	if target.is_remote:
 		cmd = appdeploy_exec_ssh_cmd(target) + [command]
+		# Show "Connecting..." status for first SSH command if it takes >1s
+		if _log_first_ssh:
+			_log_first_ssh = False
+			with appdeploy_util_delayed_status("Connecting"):
+				return _appdeploy_exec_run_impl(cmd, capture, timeout, check, target)
+		else:
+			return _appdeploy_exec_run_impl(cmd, capture, timeout, check, target)
 	else:
 		cmd = ["sh", "-c", command]
+		return _appdeploy_exec_run_impl(cmd, capture, timeout, check, target)
 
+
+def _appdeploy_exec_run_impl(
+	cmd: list[str],
+	capture: bool,
+	timeout: Optional[int],
+	check: bool,
+	target: Target,
+) -> subprocess.CompletedProcess:
+	"""Internal implementation of command execution."""
 	try:
 		result = subprocess.run(
 			cmd,
@@ -435,7 +517,9 @@ def appdeploy_exec_run(
 			)
 		return result
 	except subprocess.TimeoutExpired as e:
-		raise TimeoutError(f"Command timed out after {timeout}s: {command}") from e
+		raise TimeoutError(
+			f"Command timed out after {timeout}s: {' '.join(cmd)}"
+		) from e
 
 
 def appdeploy_exec_copy(target: Target, local_path: Path, remote_path: str) -> None:
@@ -929,23 +1013,24 @@ def appdeploy_target_bootstrap(
 
 	# Check which tools need updating (missing or checksum mismatch)
 	tools_to_update = []
-	for name, src in tools:
-		tool_path = f"{bin_dir}/{name}"
-		remote_checksum, algorithm = _get_remote_checksum(target, tool_path)
+	with appdeploy_util_delayed_status("Checking tools"):
+		for name, src in tools:
+			tool_path = f"{bin_dir}/{name}"
+			remote_checksum, algorithm = _get_remote_checksum(target, tool_path)
 
-		if remote_checksum is None:
-			appdeploy_util_verbose(f"Tool missing: {name}")
-			tools_to_update.append((name, src))
-		elif force or upgrade:
-			appdeploy_util_verbose(f"Tool force update: {name}")
-			tools_to_update.append((name, src))
-		else:
-			local_checksum = _compute_file_checksum(src, algorithm)
-			if local_checksum != remote_checksum:
-				appdeploy_util_verbose(f"Tool outdated: {name}")
+			if remote_checksum is None:
+				appdeploy_util_verbose(f"Tool missing: {name}")
+				tools_to_update.append((name, src))
+			elif force or upgrade:
+				appdeploy_util_verbose(f"Tool force update: {name}")
 				tools_to_update.append((name, src))
 			else:
-				appdeploy_util_verbose(f"Tool up-to-date: {name}")
+				local_checksum = _compute_file_checksum(src, algorithm)
+				if local_checksum != remote_checksum:
+					appdeploy_util_verbose(f"Tool outdated: {name}")
+					tools_to_update.append((name, src))
+				else:
+					appdeploy_util_verbose(f"Tool up-to-date: {name}")
 
 	if not tools_to_update:
 		appdeploy_util_verbose("All tools up-to-date")
@@ -2304,7 +2389,6 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_show.add_argument("version", nargs="?", help="Version (or use name:version)")
 	p_show.add_argument("--files", action="store_true", help="List all files")
 	p_show.add_argument("--config", action="store_true", help="Show conf.toml")
-	p_show.add_argument("--env", action="store_true", help="Show env.sh")
 	p_show.add_argument("--run", action="store_true", help="Show run script")
 	p_show.add_argument("--tree", action="store_true", help="Show directory tree")
 
@@ -2801,6 +2885,160 @@ def appdeploy_cmd_handler_restart(args: argparse.Namespace) -> int:
 		return 1
 
 
+def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, Any]:
+	"""Get runtime info for an app: PID, running state, log file mtimes."""
+	run_dir = str(target.path / app_name / "run")
+
+	info: dict[str, Any] = {
+		"running": False,
+		"state": "stopped",
+		"pid": None,
+		"log_mtime": None,
+		"err_mtime": None,
+	}
+
+	# Check PID file and if process is running
+	pid_file = f"{run_dir}/.pid"
+	result = appdeploy_exec_run(
+		target, f"cat {shlex.quote(pid_file)} 2>/dev/null", check=False
+	)
+	if result.returncode == 0 and result.stdout.strip():
+		pid = result.stdout.strip()
+		# Check if process is running
+		check_result = appdeploy_exec_run(
+			target, f"kill -0 {pid} 2>/dev/null", check=False
+		)
+		if check_result.returncode == 0:
+			info["running"] = True
+			info["state"] = "running"
+			info["pid"] = int(pid)
+
+	# Get log file modification times
+	log_file = f"{run_dir}/{app_name}.log"
+	err_file = f"{run_dir}/{app_name}.err"
+
+	# Use stat to get mtime (works on both Linux and macOS)
+	for key, filepath in [("log_mtime", log_file), ("err_mtime", err_file)]:
+		result = appdeploy_exec_run(
+			target,
+			f"stat -c '%Y' {shlex.quote(filepath)} 2>/dev/null || stat -f '%m' {shlex.quote(filepath)} 2>/dev/null",
+			check=False,
+		)
+		if result.returncode == 0 and result.stdout.strip():
+			try:
+				info[key] = float(result.stdout.strip())
+			except ValueError:
+				pass
+
+	return info
+
+
+def _appdeploy_show_status(
+	target: Target,
+	package: Optional[str] = None,
+	long_format: bool = False,
+	json_format: bool = False,
+) -> int:
+	"""Display status table for apps."""
+	import time
+
+	# Get list of installed versions
+	versions = appdeploy_target_list(target, name=package, long_format=long_format)
+
+	if not versions:
+		appdeploy_util_output("No packages installed")
+		return 0
+
+	# Group versions by app name and get runtime info for each app
+	apps: dict[str, list[InstalledVersion]] = {}
+	for v in versions:
+		if v.name not in apps:
+			apps[v.name] = []
+		apps[v.name].append(v)
+
+	# Get runtime info for each app
+	runtime_info: dict[str, dict[str, Any]] = {}
+	for app_name in apps:
+		runtime_info[app_name] = _appdeploy_get_app_runtime_info(target, app_name)
+
+	# Build output data
+	rows: list[dict[str, Any]] = []
+	for app_name, app_versions in apps.items():
+		info = runtime_info[app_name]
+		for v in app_versions:
+			row: dict[str, Any] = {
+				"name": v.name,
+				"version": v.version,
+				"status": v.status,
+				"state": info["state"] if v.status == "active" else "-",
+				"pid": str(info["pid"])
+				if v.status == "active" and info["pid"]
+				else "-",
+				"log": (
+					appdeploy_util_format_time_ago(info["log_mtime"])
+					if v.status == "active" and info["log_mtime"]
+					else "-"
+				),
+				"err": (
+					appdeploy_util_format_time_ago(info["err_mtime"])
+					if v.status == "active" and info["err_mtime"]
+					else "-"
+				),
+			}
+			if long_format:
+				row["installed"] = v.installed
+				row["size"] = v.size
+			rows.append(row)
+
+	if json_format:
+		print(json.dumps(rows, indent=2))
+		return 0
+
+	# Print target info
+	if target.host:
+		if target.user:
+			target_str = f"{target.user}@{target.host}:{target.path}"
+		else:
+			target_str = f"{target.host}:{target.path}"
+	else:
+		target_str = str(target.path)
+	print(f"Target: {target_str}")
+	print()
+
+	# Print table header
+	if long_format:
+		print(
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'LOG':<10} {'ERR':<10} {'INSTALLED':<20} {'SIZE':<10}"
+		)
+	else:
+		print(
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'LOG':<10} {'ERR':<10}"
+		)
+
+	# Print rows
+	for row in rows:
+		# Pad text first, then apply color to preserve alignment
+		status_padded = f"{row['status']:<10}"
+		state_padded = f"{row['state']:<10}"
+
+		if row["status"] == "active":
+			status_padded = appdeploy_util_color(status_padded, "green")
+		if row["state"] == "running":
+			state_padded = appdeploy_util_color(state_padded, "green")
+
+		if long_format:
+			size_str = appdeploy_util_format_size(row["size"])
+			print(
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['log']:<10} {row['err']:<10} {row['installed']:<20} {size_str:<10}"
+			)
+		else:
+			print(
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['log']:<10} {row['err']:<10}"
+			)
+
+	return 0
+
+
 def appdeploy_cmd_handler_status(args: argparse.Namespace) -> int:
 	"""Handle 'status' command."""
 	try:
@@ -2818,7 +3056,7 @@ def appdeploy_cmd_handler_status(args: argparse.Namespace) -> int:
 				while True:
 					# Clear screen
 					print("\033[2J\033[H", end="")
-					appdeploy_daemon_status(
+					_appdeploy_show_status(
 						target,
 						args.package,
 						long_format=args.long,
@@ -2828,7 +3066,7 @@ def appdeploy_cmd_handler_status(args: argparse.Namespace) -> int:
 			except KeyboardInterrupt:
 				return 0
 		else:
-			appdeploy_daemon_status(
+			_appdeploy_show_status(
 				target,
 				args.package,
 				long_format=args.long,
@@ -2922,12 +3160,6 @@ def appdeploy_cmd_handler_show(args: argparse.Namespace) -> int:
 				print(appdeploy_exec_read(target, conf_path))
 			else:
 				appdeploy_util_output("No conf.toml found")
-		elif args.env:
-			env_path = f"{ver_dir}/env.sh"
-			if appdeploy_exec_exists(target, env_path):
-				print(appdeploy_exec_read(target, env_path))
-			else:
-				appdeploy_util_output("No env.sh found")
 		elif args.run:
 			for script_name in ("run", "run.sh"):
 				run_path = f"{ver_dir}/{script_name}"
