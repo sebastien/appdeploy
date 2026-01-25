@@ -2886,13 +2886,15 @@ def appdeploy_cmd_handler_restart(args: argparse.Namespace) -> int:
 
 
 def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, Any]:
-	"""Get runtime info for an app: PID, running state, log file mtimes."""
-	run_dir = str(target.path / app_name / "run")
+	"""Get runtime info for an app: PID, running state, memory, log file mtimes."""
+	app_dir = str(target.path / app_name)
+	run_dir = f"{app_dir}/run"
 
 	info: dict[str, Any] = {
 		"running": False,
 		"state": "stopped",
 		"pid": None,
+		"memory": None,
 		"log_mtime": None,
 		"err_mtime": None,
 	}
@@ -2913,22 +2915,54 @@ def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, 
 			info["state"] = "running"
 			info["pid"] = int(pid)
 
-	# Get log file modification times
-	log_file = f"{run_dir}/{app_name}.log"
-	err_file = f"{run_dir}/{app_name}.err"
+			# Get memory usage from /proc/{pid}/statm
+			mem_result = appdeploy_exec_run(
+				target,
+				f"cat /proc/{pid}/statm 2>/dev/null",
+				check=False,
+			)
+			if mem_result.returncode == 0 and mem_result.stdout.strip():
+				try:
+					statm = mem_result.stdout.strip().split()
+					if len(statm) >= 2:
+						# RSS is second field, in pages (typically 4096 bytes)
+						rss_pages = int(statm[1])
+						info["memory"] = rss_pages * 4096  # bytes
+				except (ValueError, IndexError):
+					pass
 
-	# Use stat to get mtime (works on both Linux and macOS)
-	for key, filepath in [("log_mtime", log_file), ("err_mtime", err_file)]:
-		result = appdeploy_exec_run(
-			target,
-			f"stat -c '%Y' {shlex.quote(filepath)} 2>/dev/null || stat -f '%m' {shlex.quote(filepath)} 2>/dev/null",
-			check=False,
-		)
-		if result.returncode == 0 and result.stdout.strip():
-			try:
-				info[key] = float(result.stdout.strip())
-			except ValueError:
-				pass
+	# Get log file modification times
+	# Check both app dir and run dir for log files
+	log_locations = [
+		(f"{app_dir}/{app_name}.log", f"{app_dir}/{app_name}.err"),
+		(f"{run_dir}/{app_name}.log", f"{run_dir}/{app_name}.err"),
+	]
+
+	for log_file, err_file in log_locations:
+		# Only check if we haven't found logs yet
+		if info["log_mtime"] is None:
+			result = appdeploy_exec_run(
+				target,
+				f"stat -c '%Y' {shlex.quote(log_file)} 2>/dev/null || stat -f '%m' {shlex.quote(log_file)} 2>/dev/null",
+				check=False,
+			)
+			if result.returncode == 0 and result.stdout.strip():
+				try:
+					info["log_mtime"] = float(result.stdout.strip())
+				except ValueError:
+					pass
+
+		if info["err_mtime"] is None:
+			result = appdeploy_exec_run(
+				target,
+				f"stat -c '%Y' {shlex.quote(err_file)} 2>/dev/null || stat -f '%m' {shlex.quote(err_file)} 2>/dev/null",
+				check=False,
+			)
+			if result.returncode == 0 and result.stdout.strip():
+				try:
+					info["err_mtime"] = float(result.stdout.strip())
+				except ValueError:
+					pass
 
 	return info
 
@@ -2966,6 +3000,12 @@ def _appdeploy_show_status(
 	for app_name, app_versions in apps.items():
 		info = runtime_info[app_name]
 		for v in app_versions:
+			# Calculate memory in Mb if available
+			mem_str = "-"
+			if v.status == "active" and info.get("memory"):
+				mem_mb = info["memory"] / (1024 * 1024)
+				mem_str = f"{mem_mb:.0f}"
+
 			row: dict[str, Any] = {
 				"name": v.name,
 				"version": v.version,
@@ -2974,6 +3014,7 @@ def _appdeploy_show_status(
 				"pid": str(info["pid"])
 				if v.status == "active" and info["pid"]
 				else "-",
+				"mem": mem_str,
 				"log": (
 					appdeploy_util_format_time_ago(info["log_mtime"])
 					if v.status == "active" and info["log_mtime"]
@@ -3008,11 +3049,11 @@ def _appdeploy_show_status(
 	# Print table header
 	if long_format:
 		print(
-			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'LOG':<10} {'ERR':<10} {'INSTALLED':<20} {'SIZE':<10}"
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'LOG':<10} {'ERR':<10} {'INSTALLED':<20} {'SIZE':<10}"
 		)
 	else:
 		print(
-			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'LOG':<10} {'ERR':<10}"
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'LOG':<10} {'ERR':<10}"
 		)
 
 	# Print rows
@@ -3029,11 +3070,11 @@ def _appdeploy_show_status(
 		if long_format:
 			size_str = appdeploy_util_format_size(row["size"])
 			print(
-				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['log']:<10} {row['err']:<10} {row['installed']:<20} {size_str:<10}"
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['log']:<10} {row['err']:<10} {row['installed']:<20} {size_str:<10}"
 			)
 		else:
 			print(
-				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['log']:<10} {row['err']:<10}"
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['log']:<10} {row['err']:<10}"
 			)
 
 	return 0
