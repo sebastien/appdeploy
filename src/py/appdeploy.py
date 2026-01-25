@@ -30,6 +30,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -512,6 +513,14 @@ def _appdeploy_exec_run_impl(
 				raise SSHConnectionError(
 					_format_ssh_connection_error(target.host or "", result.stderr)
 				)
+			# For remote commands, provide a clearer error message
+			if target.is_remote:
+				remote_cmd = cmd[-1] if cmd else ""
+				stderr_msg = result.stderr.strip() if result.stderr else ""
+				error_msg = f"Remote command failed (exit code {result.returncode}): {remote_cmd}"
+				if stderr_msg:
+					error_msg += f"\n{stderr_msg}"
+				raise RuntimeError(error_msg)
 			raise subprocess.CalledProcessError(
 				result.returncode, cmd, result.stdout, result.stderr
 			)
@@ -602,12 +611,27 @@ def appdeploy_exec_rm(target: Target, path: str, recursive: bool = False) -> Non
 		return
 
 	if target.is_remote:
+		if not appdeploy_exec_exists(target, path):
+			return  # Nothing to remove
+		# Make writable before deletion (handles read-only dist/ directories)
+		if recursive:
+			appdeploy_exec_run(target, f"chmod -R +w {shlex.quote(path)}", check=False)
 		flag = "-rf" if recursive else "-f"
 		appdeploy_exec_run(target, f"rm {flag} {shlex.quote(path)}", check=True)
 	else:
 		p = Path(path)
 		if p.exists():
 			if recursive and p.is_dir():
+				# Make writable before deletion (handles read-only dist/ directories)
+				for item in p.rglob("*"):
+					try:
+						item.chmod(item.stat().st_mode | stat.S_IWUSR)
+					except OSError:
+						pass
+				try:
+					p.chmod(p.stat().st_mode | stat.S_IWUSR)
+				except OSError:
+					pass
 				shutil.rmtree(p)
 			else:
 				p.unlink()
@@ -2895,6 +2919,7 @@ def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, 
 		"state": "stopped",
 		"pid": None,
 		"memory": None,
+		"started": None,
 		"log_mtime": None,
 		"err_mtime": None,
 	}
@@ -2928,6 +2953,29 @@ def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, 
 						# RSS is second field, in pages (typically 4096 bytes)
 						rss_pages = int(statm[1])
 						info["memory"] = rss_pages * 4096  # bytes
+				except (ValueError, IndexError):
+					pass
+
+			# Get process start time from /proc/{pid}/stat field 21 and boot time
+			start_result = appdeploy_exec_run(
+				target,
+				f"cat /proc/{pid}/stat /proc/stat 2>/dev/null",
+				check=False,
+			)
+			if start_result.returncode == 0 and start_result.stdout.strip():
+				try:
+					lines = start_result.stdout.strip().split("\n")
+					stat_fields = lines[0].split()
+					# Field 21 (0-indexed) is starttime in clock ticks since boot
+					if len(stat_fields) > 21:
+						starttime_ticks = int(stat_fields[21])
+						clk_tck = 100  # Standard on Linux
+						# Find btime (boot time) from /proc/stat
+						for line in lines[1:]:
+							if line.startswith("btime "):
+								btime = int(line.split()[1])
+								info["started"] = btime + (starttime_ticks / clk_tck)
+								break
 				except (ValueError, IndexError):
 					pass
 
@@ -3015,6 +3063,11 @@ def _appdeploy_show_status(
 				if v.status == "active" and info["pid"]
 				else "-",
 				"mem": mem_str,
+				"started": (
+					appdeploy_util_format_time_ago(info["started"])
+					if v.status == "active" and info.get("started")
+					else "-"
+				),
 				"log": (
 					appdeploy_util_format_time_ago(info["log_mtime"])
 					if v.status == "active" and info["log_mtime"]
@@ -3049,11 +3102,11 @@ def _appdeploy_show_status(
 	# Print table header
 	if long_format:
 		print(
-			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'LOG':<10} {'ERR':<10} {'INSTALLED':<20} {'SIZE':<10}"
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'STARTED':<10} {'LOG':<10} {'ERR':<10} {'INSTALLED':<20} {'SIZE':<10}"
 		)
 	else:
 		print(
-			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'LOG':<10} {'ERR':<10}"
+			f"{'NAME':<20} {'VERSION':<15} {'STATUS':<10} {'STATE':<10} {'PID':<8} {'MEM(Mb)':<8} {'STARTED':<10} {'LOG':<10} {'ERR':<10}"
 		)
 
 	# Print rows
@@ -3063,18 +3116,20 @@ def _appdeploy_show_status(
 		state_padded = f"{row['state']:<10}"
 
 		if row["status"] == "active":
-			status_padded = appdeploy_util_color(status_padded, "green")
+			status_padded = appdeploy_util_color(status_padded, "blue")
 		if row["state"] == "running":
 			state_padded = appdeploy_util_color(state_padded, "green")
+		elif row["state"] == "stopped":
+			state_padded = appdeploy_util_color(state_padded, "red")
 
 		if long_format:
 			size_str = appdeploy_util_format_size(row["size"])
 			print(
-				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['log']:<10} {row['err']:<10} {row['installed']:<20} {size_str:<10}"
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['started']:<10} {row['log']:<10} {row['err']:<10} {row['installed']:<20} {size_str:<10}"
 			)
 		else:
 			print(
-				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['log']:<10} {row['err']:<10}"
+				f"{row['name']:<20} {row['version']:<15} {status_padded} {state_padded} {row['pid']:<8} {row['mem']:<8} {row['started']:<10} {row['log']:<10} {row['err']:<10}"
 			)
 
 	return 0
