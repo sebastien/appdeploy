@@ -628,8 +628,12 @@ def daemonctl_config_to_daemonrun_args(
 	log_name = config.daemon.name or app_name or "daemon"
 	app_path = daemonctl_app_path(app_name) if app_name else Path(".")
 
-	stdout_file = config.logging.stdout_file or str(app_path / f"{log_name}.log")
-	stderr_file = config.logging.stderr_file or str(app_path / f"{log_name}.err")
+	stdout_file = config.logging.stdout_file or str(
+		app_path / "logs" / f"{log_name}.log"
+	)
+	stderr_file = config.logging.stderr_file or str(
+		app_path / "logs" / f"{log_name}.err"
+	)
 	args.extend(["--stdout", stdout_file])
 	args.extend(["--stderr", stderr_file])
 
@@ -1804,6 +1808,10 @@ def daemonctl_cmd_run(args: argparse.Namespace) -> int:
 	if getattr(args, "foreground", False):
 		config.daemon.foreground = True
 
+	# Ensure logs directory exists
+	logs_dir = daemonctl_app_path(app_name) / "logs"
+	logs_dir.mkdir(parents=True, exist_ok=True)
+
 	if _dry_run:
 		daemonctl_util_log(
 			"info",
@@ -1877,6 +1885,10 @@ def daemonctl_cmd_start(args: argparse.Namespace) -> int:
 	# Apply verbose flag from CLI
 	if getattr(args, "verbose", False):
 		config.logging.verbose = True
+
+	# Ensure logs directory exists
+	logs_dir = daemonctl_app_path(app_name) / "logs"
+	logs_dir.mkdir(parents=True, exist_ok=True)
 
 	# Check if teelog is needed for log rotation
 	if daemonctl_app_needs_teelog(config):
@@ -2206,11 +2218,12 @@ def daemonctl_cmd_logs(args: argparse.Namespace) -> int:
 	# Determine log file
 	log_file = config.logging.stdout_file or config.logging.file
 	if not log_file:
-		# Try common locations
+		# Try common locations (new logs/ subdir first, then legacy locations)
 		for candidate in [
+			str(daemonctl_app_path(app_name) / "logs" / f"{app_name}.log"),
+			str(daemonctl_app_path(app_name) / f"{app_name}.log"),
 			f"/var/log/{app_name}.log",
 			f"/tmp/{app_name}.log",
-			str(daemonctl_app_path(app_name) / f"{app_name}.log"),
 		]:
 			if Path(candidate).exists():
 				log_file = candidate

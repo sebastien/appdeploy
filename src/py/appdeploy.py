@@ -2980,8 +2980,10 @@ def _appdeploy_get_app_runtime_info(target: Target, app_name: str) -> dict[str, 
 					pass
 
 	# Get log file modification times
-	# Check both app dir and run dir for log files
+	# Check logs/ subdir first (new location), then legacy locations for backward compat
 	log_locations = [
+		(f"{app_dir}/logs/{app_name}.log", f"{app_dir}/logs/{app_name}.err"),
+		(f"{run_dir}/logs/{app_name}.log", f"{run_dir}/logs/{app_name}.err"),
 		(f"{app_dir}/{app_name}.log", f"{app_dir}/{app_name}.err"),
 		(f"{run_dir}/{app_name}.log", f"{run_dir}/{app_name}.err"),
 	]
