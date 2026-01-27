@@ -1205,6 +1205,68 @@ def appdeploy_target_uninstall(
 			appdeploy_exec_rm(target, archive)
 
 
+def appdeploy_target_uninstall_size(
+	target: Target,
+	name: str,
+	version: Optional[str] = None,
+	all_versions: bool = False,
+	keep_data: bool = False,
+	keep_logs: bool = False,
+) -> Optional[int]:
+	"""Calculate disk space that would be freed by uninstall. Returns bytes or None if unknown."""
+	app_dir = str(target.path / name)
+
+	paths_to_measure: list[str] = []
+
+	if all_versions:
+		if keep_data or keep_logs:
+			# Measure specific subdirectories
+			paths_to_measure.extend(
+				[
+					f"{app_dir}/packages",
+					f"{app_dir}/dist",
+					f"{app_dir}/run",
+				]
+			)
+			if not keep_data:
+				paths_to_measure.append(f"{app_dir}/data")
+				paths_to_measure.append(f"{app_dir}/conf")
+			if not keep_logs:
+				paths_to_measure.append(f"{app_dir}/logs")
+		else:
+			# Measure entire app directory
+			paths_to_measure.append(app_dir)
+	else:
+		if not version:
+			return None
+		# Measure version directory
+		paths_to_measure.append(f"{app_dir}/dist/{version}")
+		# Measure archive (check which extension exists)
+		for ext in [".tar.gz", ".tar.bz2", ".tar.xz"]:
+			archive = f"{app_dir}/packages/{name}-{version}{ext}"
+			if appdeploy_exec_exists(target, archive):
+				paths_to_measure.append(archive)
+				break
+
+	# Calculate total size
+	total_size = 0
+	for path in paths_to_measure:
+		if not appdeploy_exec_exists(target, path):
+			continue
+		result = appdeploy_exec_run(
+			target,
+			f"du -sb {shlex.quote(path)} 2>/dev/null || du -sk {shlex.quote(path)}",
+			check=False,
+		)
+		if result.returncode == 0:
+			try:
+				total_size += int(result.stdout.split()[0])
+			except (ValueError, IndexError):
+				pass
+
+	return total_size if total_size > 0 else None
+
+
 def appdeploy_target_activate(
 	target: Target,
 	name: str,
@@ -2575,7 +2637,23 @@ def appdeploy_cmd_handler_uninstall(args: argparse.Namespace) -> int:
 			version = args.version
 
 		pkg_display = f"{name}:{version}" if version else name
-		if not appdeploy_util_confirm(f"Uninstall {pkg_display}?"):
+
+		# Calculate size to show user how much space will be freed
+		size = appdeploy_target_uninstall_size(
+			target,
+			name,
+			version=version,
+			all_versions=args.all,
+			keep_data=args.keep_data,
+			keep_logs=args.keep_logs,
+		)
+		if size:
+			size_str = appdeploy_util_format_size(size)
+			confirm_msg = f"Uninstall {pkg_display} ({size_str})?"
+		else:
+			confirm_msg = f"Uninstall {pkg_display}?"
+
+		if not appdeploy_util_confirm(confirm_msg):
 			return 3
 
 		appdeploy_target_uninstall(
