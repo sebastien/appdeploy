@@ -89,8 +89,8 @@ ${TARGET_PATH}/
             ...                 # Symlinked to run/, overrides dist/
         logs/                   # Log files
             ${NAME}.log         # Stdout log (via teelog)
-            ${NAME}.err.log     # Stderr log (via teelog)
-            ${NAME}.run.log     # Operations/event log
+            ${NAME}.err         # Stderr log (via teelog)
+            ${NAME}.run         # Operations/event log
         run/                    # Active runtime directory
             .pid                # PID file
             .version            # Active version string

@@ -3272,6 +3272,24 @@ def appdeploy_cmd_handler_show(args: argparse.Namespace) -> int:
 			appdeploy_util_output(f"Version: {version}")
 			appdeploy_util_output(f"Path: {ver_dir}")
 
+			# Show run path and its contents
+			run_dir = str(target.path / name / "run")
+			appdeploy_util_output(f"Run path: {run_dir}")
+
+			# List top-level contents of run directory
+			result = appdeploy_exec_run(
+				target, f"ls -la {shlex.quote(run_dir)}", check=False
+			)
+			if result.returncode == 0 and result.stdout.strip():
+				appdeploy_util_output("\nRun directory contents:")
+				print(result.stdout)
+
+			# Show log file paths
+			log_dir = str(target.path / name / "logs")
+			appdeploy_util_output("Log files:")
+			appdeploy_util_output(f"  Stdout: {log_dir}/{name}.log")
+			appdeploy_util_output(f"  Stderr: {log_dir}/{name}.err")
+
 			# Show config if exists
 			conf_path = f"{ver_dir}/conf.toml"
 			if appdeploy_exec_exists(target, conf_path):
