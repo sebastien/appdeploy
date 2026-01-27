@@ -1700,6 +1700,8 @@ def appdeploy_daemon_logs(
 		cmd += " --stderr"
 	elif stream == "ops":
 		cmd += " --ops"
+	elif stream == "all":
+		cmd += " --all"
 
 	if since:
 		cmd += f" --since {shlex.quote(since)}"
@@ -3186,8 +3188,11 @@ def appdeploy_cmd_handler_logs(args: argparse.Namespace) -> int:
 		)
 		appdeploy_util_set_log_target(target)
 
-		stream = "all"
-		if args.stdout:
+		# Determine stream: explicit flags take precedence, default is stdout only
+		stream = "stdout"  # Default to stdout only
+		if args.all:
+			stream = "all"
+		elif args.stdout:
 			stream = "stdout"
 		elif args.stderr:
 			stream = "stderr"

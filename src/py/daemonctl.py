@@ -2215,9 +2215,20 @@ def daemonctl_cmd_logs(args: argparse.Namespace) -> int:
 
 	config = daemonctl_config_load(app_name)
 
-	# Determine log file
-	log_file = config.logging.stdout_file or config.logging.file
-	if not log_file:
+	# Get stream selection flags
+	show_stdout_only = getattr(args, "stdout", False)
+	show_stderr_only = getattr(args, "stderr", False)
+	show_all = getattr(args, "all", False)
+	follow = getattr(args, "follow", False)
+
+	# Check for conflicting flags
+	if show_all and follow:
+		daemonctl_util_log("error", "--follow is not supported with --all")
+		return 1
+
+	# Determine stdout log file
+	stdout_file = config.logging.stdout_file or config.logging.file
+	if not stdout_file:
 		# Try common locations (new logs/ subdir first, then legacy locations)
 		for candidate in [
 			str(daemonctl_app_path(app_name) / "logs" / f"{app_name}.log"),
@@ -2226,14 +2237,40 @@ def daemonctl_cmd_logs(args: argparse.Namespace) -> int:
 			f"/tmp/{app_name}.log",
 		]:
 			if Path(candidate).exists():
-				log_file = candidate
+				stdout_file = candidate
 				break
 
-	if not log_file or not Path(log_file).exists():
-		daemonctl_util_log("error", "No log file found")
-		return 1
+	# Determine stderr log file
+	stderr_file = config.logging.stderr_file
+	if not stderr_file:
+		# Try common locations for stderr
+		for candidate in [
+			str(daemonctl_app_path(app_name) / "logs" / f"{app_name}.err"),
+			str(daemonctl_app_path(app_name) / f"{app_name}.err"),
+			f"/var/log/{app_name}.err",
+			f"/tmp/{app_name}.err",
+		]:
+			if Path(candidate).exists():
+				stderr_file = candidate
+				break
 
-	follow = getattr(args, "follow", False)
+	# Validate file availability based on mode
+	if show_stderr_only:
+		if not stderr_file or not Path(stderr_file).exists():
+			daemonctl_util_log("error", "No stderr log file found")
+			return 1
+	elif show_all:
+		stdout_exists = stdout_file and Path(stdout_file).exists()
+		stderr_exists = stderr_file and Path(stderr_file).exists()
+		if not stdout_exists and not stderr_exists:
+			daemonctl_util_log("error", "No log files found")
+			return 1
+	else:
+		# Default or --stdout: need stdout file
+		if not stdout_file or not Path(stdout_file).exists():
+			daemonctl_util_log("error", "No log file found")
+			return 1
+
 	lines = getattr(args, "lines", 50)
 	grep_pattern = getattr(args, "grep", None)
 	level_filter = getattr(args, "level", None)
@@ -2250,7 +2287,93 @@ def daemonctl_cmd_logs(args: argparse.Namespace) -> int:
 		"error": ["error", "err", "fatal"],
 	}
 
-	# Build command pipeline
+	def read_log_lines(log_file: str, num_lines: int, from_head: bool) -> list[str]:
+		"""Read lines from a log file."""
+		log_path = Path(log_file)
+		if not log_path.exists():
+			return []
+		content = log_path.read_text()
+		file_lines = content.splitlines()
+		if from_head:
+			return file_lines[:num_lines]
+		else:
+			return file_lines[-num_lines:]
+
+	def is_file_empty(log_file: str) -> bool:
+		"""Check if a log file is empty or doesn't exist."""
+		log_path = Path(log_file)
+		if not log_path.exists():
+			return True
+		return log_path.stat().st_size == 0
+
+	def filter_lines(log_lines: list[str]) -> list[str]:
+		"""Apply grep and level filters to lines."""
+		result = log_lines
+
+		# Filter by pattern
+		if grep_pattern:
+			import fnmatch
+
+			result = [
+				l
+				for l in result
+				if fnmatch.fnmatch(l.lower(), f"*{grep_pattern.lower()}*")
+			]
+
+		# Filter by level (simple keyword match)
+		if level_filter:
+			keywords = level_keywords.get(level_filter, [])
+			result = [l for l in result if any(kw in l.lower() for kw in keywords)]
+
+		return result
+
+	def output_lines(log_lines: list[str], prefix: str = "") -> None:
+		"""Output lines with optional prefix."""
+		for line in log_lines:
+			if prefix:
+				print(f"{prefix}{line}")
+			else:
+				print(line)
+
+	# Handle --all mode: show stdout then stderr with prefixes
+	if show_all:
+		try:
+			# Read and output stdout with "out: " prefix
+			if stdout_file and Path(stdout_file).exists():
+				if is_file_empty(stdout_file):
+					print("[stdout is empty]")
+				else:
+					stdout_lines = read_log_lines(stdout_file, lines, use_head)
+					stdout_lines = filter_lines(stdout_lines)
+					output_lines(stdout_lines, "out: ")
+
+			# Read and output stderr with "err: " prefix
+			if stderr_file and Path(stderr_file).exists():
+				if is_file_empty(stderr_file):
+					print("[stderr is empty]")
+				else:
+					stderr_lines = read_log_lines(stderr_file, lines, use_head)
+					stderr_lines = filter_lines(stderr_lines)
+					output_lines(stderr_lines, "err: ")
+
+			return 0
+		except KeyboardInterrupt:
+			return 0
+		except Exception as e:
+			daemonctl_util_log("error", f"Failed to read logs: {e}")
+			return 1
+
+	# Single file mode (--stdout, --stderr, or default)
+	if show_stderr_only:
+		log_file = stderr_file
+		# Check if stderr is empty
+		if is_file_empty(log_file):
+			print("[stderr is empty]")
+			return 0
+	else:
+		log_file = stdout_file
+
+	# Build command pipeline for simple cases
 	if follow:
 		cmd = ["tail", "-f", "-n", str(lines), log_file]
 	elif use_head:
@@ -2268,36 +2391,11 @@ def daemonctl_cmd_logs(args: argparse.Namespace) -> int:
 
 	# For filtering, read and process in Python
 	try:
-		log_path = Path(log_file)
-		content = log_path.read_text()
-		log_lines = content.splitlines()
-
-		# Apply head/tail
-		if use_head:
-			log_lines = log_lines[:lines]
-		else:
-			log_lines = log_lines[-lines:]
-
-		# Filter by pattern
-		if grep_pattern:
-			import fnmatch
-
-			log_lines = [
-				l
-				for l in log_lines
-				if fnmatch.fnmatch(l.lower(), f"*{grep_pattern.lower()}*")
-			]
-
-		# Filter by level (simple keyword match)
-		if level_filter:
-			keywords = level_keywords.get(level_filter, [])
-			log_lines = [
-				l for l in log_lines if any(kw in l.lower() for kw in keywords)
-			]
+		log_lines = read_log_lines(log_file, lines, use_head)
+		log_lines = filter_lines(log_lines)
 
 		# Output
-		for line in log_lines:
-			print(line)
+		output_lines(log_lines)
 
 		# If follow mode with filters, continue tailing
 		if follow:
@@ -2704,6 +2802,13 @@ def daemonctl_CLI_build_parser() -> argparse.ArgumentParser:
 		"--tail", action="store_true", help="Start from end (default for --follow)"
 	)
 	p_logs.add_argument("--head", action="store_true", help="Start from beginning")
+	p_logs.add_argument("--stdout", action="store_true", help="Show stdout logs only")
+	p_logs.add_argument("--stderr", action="store_true", help="Show stderr logs only")
+	p_logs.add_argument(
+		"--all",
+		action="store_true",
+		help="Show all logs (stdout + stderr) with prefixes",
+	)
 
 	# kill command
 	p_kill = subparsers.add_parser("kill", help="Send signal to app")
