@@ -205,6 +205,83 @@ daemonrun_log_error() {
     daemonrun_log_write 3 "$@"
 }
 
+# Function: daemonrun_signal_name EXIT_CODE
+# Converts exit code to signal name if killed by signal.
+# Exit codes 128+N indicate process was killed by signal N.
+#
+# Parameters:
+#   EXIT_CODE - Process exit code
+#
+# Returns:
+#   Outputs signal name (e.g., "SIGTERM") if killed by signal, empty otherwise.
+daemonrun_signal_name() {
+    local exit_code="$1"
+    
+    # Exit codes > 128 indicate signal death (128 + signal_number)
+    if ((exit_code > 128 && exit_code < 192)); then
+        local sig_num=$((exit_code - 128))
+        case "$sig_num" in
+            1)  echo "SIGHUP" ;;
+            2)  echo "SIGINT" ;;
+            3)  echo "SIGQUIT" ;;
+            6)  echo "SIGABRT" ;;
+            9)  echo "SIGKILL" ;;
+            13) echo "SIGPIPE" ;;
+            14) echo "SIGALRM" ;;
+            15) echo "SIGTERM" ;;
+            10) echo "SIGUSR1" ;;
+            12) echo "SIGUSR2" ;;
+            *)  echo "SIG$sig_num" ;;
+        esac
+    fi
+}
+
+# Function: daemonrun_applog_write TARGET LEVEL MESSAGE...
+# Writes timestamped lifecycle events to application stdout/stderr log files.
+# This is separate from daemonrun's internal logging - these messages appear
+# in the application's own log files to help synchronize log analysis.
+#
+# Parameters:
+#   TARGET  - "stdout", "stderr", or "both"
+#   LEVEL   - INFO, WARN, ERROR
+#   MESSAGE - Log message
+daemonrun_applog_write() {
+    local target="$1"
+    local level="$2"
+    shift 2
+    local message="$*"
+    
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local group="${_DAEMONRUN_GROUP:-daemonrun}"
+    local pid="${_DAEMONRUN_CHILD_PID:-$$}"
+    local line="$timestamp [$level] [$group:$pid] $message"
+    
+    case "$target" in
+        stdout)
+            if [[ -n "$_DAEMONRUN_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_DAEMONRUN_STDOUT_FILE"
+            fi
+            ;;
+        stderr)
+            if [[ -n "$_DAEMONRUN_STDERR_FILE" ]]; then
+                echo "$line" >> "$_DAEMONRUN_STDERR_FILE"
+            elif [[ -n "$_DAEMONRUN_STDOUT_FILE" ]]; then
+                # Fall back to stdout file if no separate stderr
+                echo "$line" >> "$_DAEMONRUN_STDOUT_FILE"
+            fi
+            ;;
+        both)
+            if [[ -n "$_DAEMONRUN_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_DAEMONRUN_STDOUT_FILE"
+            fi
+            if [[ -n "$_DAEMONRUN_STDERR_FILE" ]] && [[ "$_DAEMONRUN_STDERR_FILE" != "$_DAEMONRUN_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_DAEMONRUN_STDERR_FILE"
+            fi
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 #
 # PARSING
@@ -937,6 +1014,8 @@ daemonrun_signal_handler() {
     local sig="$1"
 
     daemonrun_log_info "Received SIG$sig, forwarding to process group"
+    # Log to application stderr for visibility
+    daemonrun_applog_write stderr INFO "Received SIG$sig, forwarding to process group"
 
     # For TERM and INT, initiate graceful termination
     if [[ "$sig" == "TERM" ]] || [[ "$sig" == "INT" ]]; then
@@ -972,6 +1051,7 @@ daemonrun_signal_terminate() {
     fi
 
     daemonrun_log_info "Initiating graceful termination (timeout: ${timeout}s)"
+    daemonrun_applog_write stderr INFO "Initiating graceful termination (timeout: ${timeout}s)"
 
     # Send SIGTERM to process group (skip if timeout is 0)
     if ((timeout > 0)); then
@@ -982,6 +1062,7 @@ daemonrun_signal_terminate() {
         while ((elapsed < timeout)); do
             if ! kill -0 "$_DAEMONRUN_CHILD_PID" 2>/dev/null; then
                 daemonrun_log_info "Process terminated gracefully"
+                daemonrun_applog_write stderr INFO "Process terminated gracefully"
                 return 0
             fi
             sleep 1
@@ -989,6 +1070,7 @@ daemonrun_signal_terminate() {
         done
 
         daemonrun_log_warn "Graceful termination timeout, sending SIGKILL"
+        daemonrun_applog_write stderr WARN "Graceful termination timeout, sending SIGKILL"
     fi
 
     # Force kill
@@ -1686,6 +1768,8 @@ daemonrun_run_foreground() {
     fi
 
     daemonrun_log_info "Started process (PID: $_DAEMONRUN_CHILD_PID, PGID: $_DAEMONRUN_PGID)"
+    # Log daemon start to application stdout
+    daemonrun_applog_write stdout INFO "Daemon started (PID: $_DAEMONRUN_CHILD_PID)"
 
     # Write PID file
     daemonrun_pidfile_write "$_DAEMONRUN_CHILD_PID"
@@ -1700,7 +1784,19 @@ daemonrun_run_foreground() {
     local exit_code=0
     wait "$_DAEMONRUN_CHILD_PID" || exit_code=$?
 
-    daemonrun_log_info "Process exited with code: $exit_code"
+    # Log exit with signal decoding if applicable
+    local sig_name
+    sig_name=$(daemonrun_signal_name "$exit_code")
+    if [[ -n "$sig_name" ]]; then
+        daemonrun_log_info "Process killed by $sig_name (exit code: $exit_code)"
+        daemonrun_applog_write stderr ERROR "Process killed by $sig_name (exit code: $exit_code)"
+    elif [[ "$exit_code" -eq 0 ]]; then
+        daemonrun_log_info "Process exited with code: $exit_code"
+        daemonrun_applog_write stderr INFO "Process exited with code: $exit_code"
+    else
+        daemonrun_log_info "Process exited with code: $exit_code"
+        daemonrun_applog_write stderr ERROR "Process exited with code: $exit_code"
+    fi
 
     return "$exit_code"
 }
@@ -1815,58 +1911,229 @@ daemonrun_run_daemon() {
     local daemon_script
     daemon_script=$(mktemp)
 
+    # Build the common wrapper script components
+    # The wrapper handles signal forwarding, lifecycle logging, and child process management
+    local group_name="${_DAEMONRUN_GROUP:-daemonrun}"
+    local signals_to_forward="TERM INT HUP USR1 USR2 QUIT"
+    local kill_timeout="${_DAEMONRUN_KILL_TIMEOUT:-10}"
+
     if [[ "$use_syslog" == true ]] && [[ -z "$_DAEMONRUN_STDOUT_FILE" ]] && [[ -z "$_DAEMONRUN_STDERR_FILE" ]]; then
         # Use logger for syslog output, but also write to log file
-        cat > "$daemon_script" <<EOF
+        cat > "$daemon_script" <<'WRAPPER_HEAD'
 #!/bin/bash
+set -o monitor  # Enable job control for proper signal handling
+
 exec 0</dev/null
-exec 1> >(tee -a "$stdout_file" | logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.info)
-exec 2> >(tee -a "$stdout_file" | logger -t "${_DAEMONRUN_GROUP:-daemonrun}" -p daemon.err)
+WRAPPER_HEAD
+        cat >> "$daemon_script" <<EOF
+exec 1> >(tee -a "$stdout_file" | logger -t "$group_name" -p daemon.info)
+exec 2> >(tee -a "$stdout_file" | logger -t "$group_name" -p daemon.err)
 
-echo \$\$ > "$pidfile"
-
-$ulimit_cmds
-
-rm -f "$daemon_script"
-
-# Replace shell with the command (ensures PID in pidfile is the actual process)
-exec $quoted_cmd
+_GROUP="$group_name"
+_STDOUT_FILE="$stdout_file"
+_STDERR_FILE=""
+_KILL_TIMEOUT=$kill_timeout
 EOF
     elif [[ -n "$stderr_file" ]]; then
         # Both stdout and stderr configured
-        cat > "$daemon_script" <<EOF
+        cat > "$daemon_script" <<'WRAPPER_HEAD'
 #!/bin/bash
+set -o monitor  # Enable job control for proper signal handling
+
 exec 0</dev/null
+WRAPPER_HEAD
+        cat >> "$daemon_script" <<EOF
 exec 1>>"$stdout_file"
 exec 2>>"$stderr_file"
 
-echo \$\$ > "$pidfile"
-
-$ulimit_cmds
-
-rm -f "$daemon_script"
-
-# Replace shell with the command (ensures PID in pidfile is the actual process)
-exec $quoted_cmd
+_GROUP="$group_name"
+_STDOUT_FILE="$stdout_file"
+_STDERR_FILE="$stderr_file"
+_KILL_TIMEOUT=$kill_timeout
 EOF
     else
         # Only stdout configured - stderr follows stdout
-        cat > "$daemon_script" <<EOF
+        cat > "$daemon_script" <<'WRAPPER_HEAD'
 #!/bin/bash
+set -o monitor  # Enable job control for proper signal handling
+
 exec 0</dev/null
+WRAPPER_HEAD
+        cat >> "$daemon_script" <<EOF
 exec 1>>"$stdout_file"
 exec 2>&1
 
-echo \$\$ > "$pidfile"
-
-$ulimit_cmds
-
-rm -f "$daemon_script"
-
-# Replace shell with the command (ensures PID in pidfile is the actual process)
-exec $quoted_cmd
+_GROUP="$group_name"
+_STDOUT_FILE="$stdout_file"
+_STDERR_FILE=""
+_KILL_TIMEOUT=$kill_timeout
 EOF
     fi
+
+    # Add the common wrapper logic to all script variants
+    cat >> "$daemon_script" <<'WRAPPER_COMMON'
+
+_CHILD_PID=""
+_TERMINATING=false
+
+# Function: _log_lifecycle TARGET LEVEL MESSAGE
+# Writes timestamped lifecycle events to log files
+_log_lifecycle() {
+    local target="$1" level="$2"
+    shift 2
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local pid="${_CHILD_PID:-$$}"
+    local line="$ts [$level] [$_GROUP:$pid] $*"
+    
+    case "$target" in
+        stdout)
+            if [[ -n "$_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_STDOUT_FILE"
+            else
+                echo "$line"
+            fi
+            ;;
+        stderr)
+            if [[ -n "$_STDERR_FILE" ]]; then
+                echo "$line" >> "$_STDERR_FILE"
+            elif [[ -n "$_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_STDOUT_FILE"
+            else
+                echo "$line" >&2
+            fi
+            ;;
+        both)
+            if [[ -n "$_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_STDOUT_FILE"
+            else
+                echo "$line"
+            fi
+            if [[ -n "$_STDERR_FILE" ]] && [[ "$_STDERR_FILE" != "$_STDOUT_FILE" ]]; then
+                echo "$line" >> "$_STDERR_FILE"
+            fi
+            ;;
+    esac
+}
+
+# Function: _signal_name EXIT_CODE
+# Converts exit code to signal name if killed by signal
+_signal_name() {
+    local exit_code="$1"
+    if ((exit_code > 128 && exit_code < 192)); then
+        local sig_num=$((exit_code - 128))
+        case "$sig_num" in
+            1)  echo "SIGHUP" ;;
+            2)  echo "SIGINT" ;;
+            3)  echo "SIGQUIT" ;;
+            6)  echo "SIGABRT" ;;
+            9)  echo "SIGKILL" ;;
+            13) echo "SIGPIPE" ;;
+            14) echo "SIGALRM" ;;
+            15) echo "SIGTERM" ;;
+            10) echo "SIGUSR1" ;;
+            12) echo "SIGUSR2" ;;
+            *)  echo "SIG$sig_num" ;;
+        esac
+    fi
+}
+
+# Function: _graceful_terminate
+# Initiates graceful termination with timeout, then SIGKILL
+_graceful_terminate() {
+    if [[ "$_TERMINATING" == true ]]; then
+        return 0
+    fi
+    _TERMINATING=true
+    
+    if [[ -z "$_CHILD_PID" ]] || ! kill -0 "$_CHILD_PID" 2>/dev/null; then
+        return 0
+    fi
+    
+    _log_lifecycle stderr INFO "Initiating graceful termination (timeout: ${_KILL_TIMEOUT}s)"
+    
+    # Send SIGTERM to child process (and its children via process group)
+    # Use negative PID to send to the child's process group
+    kill -TERM "-$_CHILD_PID" 2>/dev/null || kill -TERM "$_CHILD_PID" 2>/dev/null || true
+    
+    # Wait for child to exit
+    local elapsed=0
+    while ((elapsed < _KILL_TIMEOUT)); do
+        if ! kill -0 "$_CHILD_PID" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        ((elapsed++)) || true
+    done
+    
+    _log_lifecycle stderr WARN "Graceful termination timeout, sending SIGKILL"
+    kill -KILL "-$_CHILD_PID" 2>/dev/null || kill -KILL "$_CHILD_PID" 2>/dev/null || true
+}
+
+# Function: _signal_handler SIGNAL
+# Handler for trapped signals - forwards to child process group
+_signal_handler() {
+    local sig="$1"
+    _log_lifecycle stderr INFO "Received SIG$sig, forwarding to process group"
+    
+    if [[ "$sig" == "TERM" ]] || [[ "$sig" == "INT" ]]; then
+        _graceful_terminate
+    else
+        # Forward other signals to child process group
+        if [[ -n "$_CHILD_PID" ]]; then
+            kill -"$sig" "-$_CHILD_PID" 2>/dev/null || kill -"$sig" "$_CHILD_PID" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Install signal handlers
+for _sig in TERM INT HUP USR1 USR2 QUIT; do
+    trap "_signal_handler $_sig" "$_sig"
+done
+
+# Cleanup handler
+trap 'wait 2>/dev/null' EXIT
+
+WRAPPER_COMMON
+
+    # Add ulimit commands and the actual command execution
+    cat >> "$daemon_script" <<EOF
+
+# Apply resource limits
+$ulimit_cmds
+
+# Remove the temporary script
+rm -f "$daemon_script"
+
+# Write PID file with the wrapper PID (so signals come to us first)
+echo "\$\$" > "$pidfile"
+
+# Log daemon start
+_log_lifecycle stdout INFO "Daemon started (PID: \$\$)"
+
+# Run the command in background within this process group
+$quoted_cmd &
+_CHILD_PID=\$!
+
+# Wait for child to exit
+wait "\$_CHILD_PID" 2>/dev/null
+_EXIT_CODE=\$?
+
+# Log exit with signal decoding if applicable
+_SIG_NAME=\$(_signal_name "\$_EXIT_CODE")
+if [[ -n "\$_SIG_NAME" ]]; then
+    _log_lifecycle stderr ERROR "Process killed by \$_SIG_NAME (exit code: \$_EXIT_CODE)"
+elif [[ "\$_EXIT_CODE" -eq 0 ]]; then
+    _log_lifecycle stderr INFO "Process exited with code: \$_EXIT_CODE"
+else
+    _log_lifecycle stderr ERROR "Process exited with code: \$_EXIT_CODE"
+fi
+
+# Remove PID file
+rm -f "$pidfile" 2>/dev/null || true
+
+exit "\$_EXIT_CODE"
+EOF
     chmod +x "$daemon_script"
 
     # First fork - creates intermediate process
