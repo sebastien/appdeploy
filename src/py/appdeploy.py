@@ -2414,7 +2414,18 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_bootstrap.add_argument(
 		"--enable",
 		action="store_true",
-		help="Enable systemd service (with --with-systemd)",
+		default=True,
+		help="Enable systemd service (with --with-systemd) (default)",
+	)
+	p_bootstrap.add_argument(
+		"--no-enable",
+		action="store_true",
+		help="Do not enable systemd service (with --with-systemd)",
+	)
+	p_bootstrap.add_argument(
+		"--no-linger",
+		action="store_true",
+		help="Do not enable lingering (services require login)",
 	)
 	p_bootstrap.add_argument("--tools-path", help="Use tools from this path")
 
@@ -2530,7 +2541,14 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	)
 	p_systemd_install.add_argument("target", help="Target host[:path] or path")
 	p_systemd_install.add_argument(
-		"-e", "--enable", action="store_true", help="Enable service after install"
+		"-e",
+		"--enable",
+		action="store_true",
+		default=True,
+		help="Enable service after install (default)",
+	)
+	p_systemd_install.add_argument(
+		"--no-enable", action="store_true", help="Do not enable service after install"
 	)
 	p_systemd_install.add_argument(
 		"-s", "--start", action="store_true", help="Start service after install"
@@ -2539,7 +2557,13 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 		"-L",
 		"--linger",
 		action="store_true",
-		help="Enable lingering (start at boot without login)",
+		default=True,
+		help="Enable lingering (start at boot without login) (default)",
+	)
+	p_systemd_install.add_argument(
+		"--no-linger",
+		action="store_true",
+		help="Do not enable lingering (services require login)",
 	)
 	p_systemd_install.add_argument(
 		"-l", "--local", action="store_true", help="Force local target"
@@ -2970,8 +2994,9 @@ def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 		if getattr(args, "with_systemd", False):
 			systemd_ok = appdeploy_systemd_install(
 				target,
-				enable=getattr(args, "enable", False),
+				enable=getattr(args, "enable", True),
 				start=False,  # Don't auto-start, let user decide when to start
+				linger=not getattr(args, "no_linger", False),
 			)
 			if not systemd_ok:
 				return 1
@@ -2984,9 +3009,9 @@ def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 
 def appdeploy_systemd_install(
 	target: Target,
-	enable: bool = False,
+	enable: bool = True,
 	start: bool = False,
-	linger: bool = False,
+	linger: bool = True,
 ) -> bool:
 	"""Install systemd user service unit for appdeploy.
 
