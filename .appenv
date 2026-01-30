@@ -1,1 +1,5 @@
+appenv_declare appdeploy
 appenv_prepend PATH $APPENV_DIR/bin
+appenv_set DAEMONCTL_PATH $APPENV_DIR/tests/data/apps
+appenv_set APPDEPLOY_TARGET $APPEND_DIR/tests/data/apps
+# EOF

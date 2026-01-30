@@ -1,0 +1,14 @@
+[daemon]
+name = "inactive-app"
+description = "Installed app without .version (inactive)"
+enabled = true
+
+[process]
+restart = false
+start_timeout = 10
+
+[logging]
+level = "info"
+
+[pidfile]
+enabled = true

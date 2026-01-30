@@ -655,6 +655,8 @@ Installs or updates tools on target.
 --force                      # Reinstall even if already present and compatible
 --check                      # Check tool status without installing (exit 0=ok, 1=missing/outdated)
 --upgrade                    # Upgrade tools if newer versions available
+--with-systemd               # Also install systemd user service unit
+--enable                     # Enable systemd service (requires --with-systemd)
 --tools-path PATH            # Use tools from PATH instead of bundled
 ```
 
@@ -831,6 +833,85 @@ appdeploy kill myapp HUP                     # Send SIGHUP (reload)
 appdeploy -t prod-server kill myapp USR1     # Send SIGUSR1 to remote
 appdeploy kill myapp 9                       # Send SIGKILL (not recommended)
 ```
+
+---
+
+### `appdeploy systemd install [OPTIONS] TARGET`
+
+Installs systemd user service unit for managing all applications.
+
+```
+-e, --enable                 # Enable service after install
+-s, --start                  # Start service after install
+-L, --linger                 # Enable lingering (start at boot without login)
+-l, --local                  # Force local target
+-r, --remote                 # Force remote target
+```
+
+**Behavior**:
+- Auto-bootstraps tools if not present
+- Installs `appdeploy.service` to `~/.config/systemd/user/`
+- Creates unit file with proper DAEMONCTL_PATH and paths
+- Reloads systemd daemon (`systemctl --user daemon-reload`)
+- Optionally enables and/or starts the service
+- With `--linger`: enables lingering for boot startup
+
+**No root required**: Uses user-mode systemd (`--user` flag).
+
+**Boot Startup**:
+
+By default, user-mode systemd services start when the user logs in and stop when they log out. To start services at boot without requiring a login session:
+
+```bash
+appdeploy systemd install agent@stage --enable --linger
+```
+
+The `--linger` flag runs `loginctl enable-linger` on the target, which allows user services to:
+- Start at system boot
+- Continue running after user logout
+- Restart automatically on failure
+
+**Note**: Lingering requires systemd support on the target system and appropriate permissions.
+
+**Usage after install**:
+```bash
+systemctl --user start appdeploy.service    # Start all active apps
+systemctl --user stop appdeploy.service     # Stop all apps
+systemctl --user status appdeploy.service   # Check status
+```
+
+---
+
+### `appdeploy systemd uninstall [OPTIONS] TARGET`
+
+Removes systemd user service unit.
+
+```
+-s, --stop                   # Stop service before uninstalling
+-l, --local                  # Force local target
+-r, --remote                 # Force remote target
+```
+
+**Behavior**:
+- Stops service if running (with `--stop`)
+- Disables service
+- Removes unit file from `~/.config/systemd/user/`
+- Reloads systemd daemon
+
+---
+
+### `appdeploy systemd status [OPTIONS] TARGET`
+
+Shows systemd service status.
+
+```
+-l, --local                  # Force local target
+-r, --remote                 # Force remote target
+```
+
+**Output**:
+- Shows whether unit is installed, enabled, and active
+- Reports path to unit file
 
 ---
 

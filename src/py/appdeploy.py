@@ -60,6 +60,18 @@ BUNDLED_DAEMONCTL = _SCRIPT_DIR / "appdeploy.daemonctl"
 BUNDLED_DAEMONRUN = _SCRIPT_DIR / "appdeploy.daemonrun"
 BUNDLED_TEELOG = _SCRIPT_DIR / "appdeploy.teelog"
 
+# Systemd template discovery - search multiple locations
+SYSTEMD_TEMPLATE_PATHS = [
+	# Relative to script (src/py/ -> src/systemd/)
+	_SCRIPT_DIR / ".." / "systemd" / "appdeploy.service",
+	# Same directory as script
+	_SCRIPT_DIR / "systemd" / "appdeploy.service",
+	# System locations
+	Path("/usr/share/appdeploy/systemd/appdeploy.service"),
+	Path("/opt/appdeploy/systemd/appdeploy.service"),
+	Path("/etc/appdeploy/systemd/appdeploy.service"),
+]
+
 # Global runtime state
 _verbose = False
 _quiet = False
@@ -582,7 +594,13 @@ def appdeploy_exec_exists(target: Target, path: str) -> bool:
 	appdeploy_util_verbose(f"exists? {path}")
 
 	if target.is_remote:
-		result = appdeploy_exec_run(target, f"test -e {shlex.quote(path)}", check=False)
+		# For paths with shell variables (e.g., $HOME), don't quote - let shell expand
+		# For regular paths, quote to handle special characters
+		if path.startswith("$") or "/$" in path:
+			cmd = f"test -e {path}"
+		else:
+			cmd = f"test -e {shlex.quote(path)}"
+		result = appdeploy_exec_run(target, cmd, check=False)
 		return result.returncode == 0
 	else:
 		return Path(path).exists()
@@ -2390,6 +2408,14 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_bootstrap.add_argument(
 		"--upgrade", action="store_true", help="Upgrade if newer available"
 	)
+	p_bootstrap.add_argument(
+		"--with-systemd", action="store_true", help="Also install systemd user service"
+	)
+	p_bootstrap.add_argument(
+		"--enable",
+		action="store_true",
+		help="Enable systemd service (with --with-systemd)",
+	)
 	p_bootstrap.add_argument("--tools-path", help="Use tools from this path")
 
 	# --- Runtime Commands ---
@@ -2491,6 +2517,63 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 		"-w", "--wait", action="store_true", help="Wait for signal processing"
 	)
 	p_kill.add_argument("--timeout", type=int, default=30, help="Wait timeout")
+
+	# systemd command (with sub-subcommands)
+	p_systemd = subparsers.add_parser("systemd", help="Systemd user service management")
+	systemd_sub = p_systemd.add_subparsers(
+		dest="systemd_command", title="systemd commands"
+	)
+
+	# systemd install
+	p_systemd_install = systemd_sub.add_parser(
+		"install", help="Install systemd user service unit"
+	)
+	p_systemd_install.add_argument("target", help="Target host[:path] or path")
+	p_systemd_install.add_argument(
+		"-e", "--enable", action="store_true", help="Enable service after install"
+	)
+	p_systemd_install.add_argument(
+		"-s", "--start", action="store_true", help="Start service after install"
+	)
+	p_systemd_install.add_argument(
+		"-L",
+		"--linger",
+		action="store_true",
+		help="Enable lingering (start at boot without login)",
+	)
+	p_systemd_install.add_argument(
+		"-l", "--local", action="store_true", help="Force local target"
+	)
+	p_systemd_install.add_argument(
+		"-r", "--remote", action="store_true", help="Force remote target"
+	)
+
+	# systemd uninstall
+	p_systemd_uninstall = systemd_sub.add_parser(
+		"uninstall", help="Uninstall systemd user service unit"
+	)
+	p_systemd_uninstall.add_argument("target", help="Target host[:path] or path")
+	p_systemd_uninstall.add_argument(
+		"-s", "--stop", action="store_true", help="Stop service before uninstall"
+	)
+	p_systemd_uninstall.add_argument(
+		"-l", "--local", action="store_true", help="Force local target"
+	)
+	p_systemd_uninstall.add_argument(
+		"-r", "--remote", action="store_true", help="Force remote target"
+	)
+
+	# systemd status
+	p_systemd_status = systemd_sub.add_parser(
+		"status", help="Show systemd user service status"
+	)
+	p_systemd_status.add_argument("target", help="Target host[:path] or path")
+	p_systemd_status.add_argument(
+		"-l", "--local", action="store_true", help="Force local target"
+	)
+	p_systemd_status.add_argument(
+		"-r", "--remote", action="store_true", help="Force remote target"
+	)
 
 	return parser
 
@@ -2879,10 +2962,192 @@ def appdeploy_cmd_handler_bootstrap(args: argparse.Namespace) -> int:
 			upgrade=args.upgrade,
 			tools_path=tools_path,
 		)
-		return 0 if ok else 1
+
+		if not ok:
+			return 1
+
+		# Optionally install systemd user service
+		if getattr(args, "with_systemd", False):
+			systemd_ok = appdeploy_systemd_install(
+				target,
+				enable=getattr(args, "enable", False),
+				start=False,  # Don't auto-start, let user decide when to start
+			)
+			if not systemd_ok:
+				return 1
+
+		return 0
 	except Exception as e:
 		appdeploy_util_error(str(e))
 		return 1
+
+
+def appdeploy_systemd_install(
+	target: Target,
+	enable: bool = False,
+	start: bool = False,
+	linger: bool = False,
+) -> bool:
+	"""Install systemd user service unit for appdeploy.
+
+	Installs the appdeploy.service unit to ~/.config/systemd/user/ on the target.
+	No root required - uses user-mode systemd.
+	"""
+	# User-mode systemd paths (use $HOME for shell expansion)
+	unit_dir = "$HOME/.config/systemd/user"
+	unit_file = f"{unit_dir}/appdeploy.service"
+
+	# Find the unit template by searching known locations
+	template_path = None
+	for path in SYSTEMD_TEMPLATE_PATHS:
+		if path.exists():
+			template_path = path
+			break
+
+	if not template_path:
+		# Show searched paths in error for debugging
+		searched = "\n  ".join(str(p) for p in SYSTEMD_TEMPLATE_PATHS)
+		appdeploy_util_error(
+			f"Systemd unit template not found. Searched:\n  {searched}"
+		)
+		return False
+
+	# Read template
+	template_content = template_path.read_text()
+
+	# Replace placeholders
+	bin_path = str(target.path / "bin")
+	target_path = str(target.path)
+	unit_content = template_content.replace("%BIN_PATH%", bin_path)
+	unit_content = unit_content.replace("%TARGET_PATH%", target_path)
+
+	if _dry_run:
+		appdeploy_util_output(f"[dry-run] Would install systemd unit to {unit_file}")
+		appdeploy_util_output(f"[dry-run] Unit content:\n{unit_content}")
+		if enable:
+			appdeploy_util_output("[dry-run] Would enable appdeploy.service")
+		if linger:
+			appdeploy_util_output(
+				"[dry-run] Would enable lingering (loginctl enable-linger)"
+			)
+		if start:
+			appdeploy_util_output("[dry-run] Would start appdeploy.service")
+		return True
+
+	# Create unit directory (don't quote $HOME, let shell expand it)
+	appdeploy_exec_run(target, f"mkdir -p {unit_dir}", check=True)
+
+	# Write unit file (don't quote $HOME, let shell expand it)
+	quoted_content = unit_content.replace("'", "'\"'\"'")
+	cmd = f"cat > {unit_file} << 'UNITEOF'\n{unit_content}\nUNITEOF"
+	appdeploy_exec_run(target, cmd, check=True)
+
+	appdeploy_util_log_op(f"Installed systemd unit to {unit_file}")
+
+	# Reload systemd daemon
+	appdeploy_exec_run(target, "systemctl --user daemon-reload", check=False)
+
+	if enable:
+		appdeploy_exec_run(
+			target, "systemctl --user enable appdeploy.service", check=False
+		)
+		appdeploy_util_log_op("Enabled appdeploy.service")
+
+	if linger:
+		# Enable lingering to start user services at boot without login
+		appdeploy_exec_run(target, "loginctl enable-linger", check=False)
+		appdeploy_util_log_op("Enabled lingering (services start at boot)")
+
+	if start:
+		appdeploy_exec_run(
+			target, "systemctl --user start appdeploy.service", check=False
+		)
+		appdeploy_util_log_op("Started appdeploy.service")
+
+	return True
+
+
+def appdeploy_systemd_uninstall(
+	target: Target,
+	stop: bool = False,
+) -> bool:
+	"""Uninstall systemd user service unit.
+
+	Removes the appdeploy.service unit from ~/.config/systemd/user/
+	"""
+	unit_file = "$HOME/.config/systemd/user/appdeploy.service"
+
+	# Check if installed
+	if not appdeploy_exec_exists(target, unit_file):
+		appdeploy_util_log_op("Systemd unit not installed")
+		return True
+
+	if _dry_run:
+		appdeploy_util_output(
+			f"[dry-run] Would uninstall systemd unit from {unit_file}"
+		)
+		return True
+
+	# Stop if requested
+	if stop:
+		appdeploy_exec_run(
+			target, "systemctl --user stop appdeploy.service", check=False
+		)
+		appdeploy_util_log_op("Stopped appdeploy.service")
+
+	# Disable
+	appdeploy_exec_run(
+		target, "systemctl --user disable appdeploy.service", check=False
+	)
+
+	# Remove unit file
+	appdeploy_exec_run(target, f"rm {unit_file}", check=True)
+
+	# Reload systemd daemon
+	appdeploy_exec_run(target, "systemctl --user daemon-reload", check=False)
+
+	appdeploy_util_log_op(f"Uninstalled systemd unit from {unit_file}")
+	return True
+
+
+def appdeploy_systemd_status(target: Target) -> dict:
+	"""Check systemd service status.
+
+	Returns dict with:
+	- installed: bool
+	- enabled: bool
+	- active: bool
+	"""
+	unit_file = "$HOME/.config/systemd/user/appdeploy.service"
+	result = {
+		"installed": False,
+		"enabled": False,
+		"active": False,
+		"unit_path": "",
+	}
+
+	# Check if unit file exists
+	if appdeploy_exec_exists(target, unit_file):
+		result["installed"] = True
+		result["unit_path"] = unit_file
+
+	# Check if enabled
+	status_result = appdeploy_exec_run(
+		target,
+		"systemctl --user is-enabled appdeploy.service 2>/dev/null",
+		check=False,
+	)
+	result["enabled"] = status_result.returncode == 0
+
+	# Check if active
+	status_result = appdeploy_exec_run(
+		target,
+		"systemctl --user is-active appdeploy.service 2>/dev/null",
+		check=False,
+	)
+	result["active"] = status_result.returncode == 0
+
+	return result
 
 
 def appdeploy_cmd_handler_start(args: argparse.Namespace) -> int:
@@ -3409,6 +3674,77 @@ def appdeploy_cmd_handler_kill(args: argparse.Namespace) -> int:
 		return 1
 
 
+def appdeploy_cmd_handler_systemd_install(args: argparse.Namespace) -> int:
+	"""Handle 'systemd install' command."""
+	try:
+		target = appdeploy_target_parse(
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
+		)
+		appdeploy_util_set_log_target(target)
+
+		# Bootstrap first to ensure daemonctl is available
+		appdeploy_target_bootstrap(target)
+
+		ok = appdeploy_systemd_install(
+			target,
+			enable=args.enable,
+			start=args.start,
+			linger=args.linger,
+		)
+		return 0 if ok else 1
+	except Exception as e:
+		appdeploy_util_error(str(e))
+		return 1
+
+
+def appdeploy_cmd_handler_systemd_uninstall(args: argparse.Namespace) -> int:
+	"""Handle 'systemd uninstall' command."""
+	try:
+		target = appdeploy_target_parse(
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
+		)
+		appdeploy_util_set_log_target(target)
+
+		ok = appdeploy_systemd_uninstall(
+			target,
+			stop=args.stop,
+		)
+		return 0 if ok else 1
+	except Exception as e:
+		appdeploy_util_error(str(e))
+		return 1
+
+
+def appdeploy_cmd_handler_systemd_status(args: argparse.Namespace) -> int:
+	"""Handle 'systemd status' command."""
+	try:
+		target = appdeploy_target_parse(
+			args.target,
+			force_local=getattr(args, "local", False),
+			force_remote=getattr(args, "remote", False),
+		)
+		appdeploy_util_set_log_target(target)
+
+		status = appdeploy_systemd_status(target)
+
+		# Print status in human-readable format
+		if status["installed"]:
+			appdeploy_util_log_op(f"Systemd unit: installed ({status['unit_path']})")
+			appdeploy_util_log_op(f"Enabled: {'yes' if status['enabled'] else 'no'}")
+			appdeploy_util_log_op(f"Active: {'yes' if status['active'] else 'no'}")
+		else:
+			appdeploy_util_log_op("Systemd unit: not installed")
+
+		return 0
+	except Exception as e:
+		appdeploy_util_error(str(e))
+		return 1
+
+
 # --- Main Entry Point ---
 
 
@@ -3444,6 +3780,21 @@ def appdeploy_main() -> int:
 	if not args.command:
 		parser.print_help()
 		return 0
+
+	# Handle systemd subcommands
+	if args.command == "systemd":
+		systemd_cmd = getattr(args, "systemd_command", None)
+		if systemd_cmd == "install":
+			return appdeploy_cmd_handler_systemd_install(args)
+		elif systemd_cmd == "uninstall":
+			return appdeploy_cmd_handler_systemd_uninstall(args)
+		elif systemd_cmd == "status":
+			return appdeploy_cmd_handler_systemd_status(args)
+		else:
+			appdeploy_util_error(
+				"Usage: appdeploy systemd {install,uninstall,status} ..."
+			)
+			return 1
 
 	# Command dispatch
 	handlers = {

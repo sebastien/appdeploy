@@ -1,0 +1,24 @@
+[Unit]
+Description=AppDeploy Application Manager
+Documentation=https://github.com/sebastien/appdeploy
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment="DAEMONCTL_PATH=%TARGET_PATH%"
+Environment="DAEMONCTL_LOG_LEVEL=info"
+Environment="APPDEPLOY_TARGET=%TARGET_PATH%"
+
+# Start all active applications
+ExecStart=%BIN_PATH%/daemonctl start-all --only-active --verbose
+
+# Stop all applications gracefully
+ExecStop=%BIN_PATH%/daemonctl stop-all --verbose
+
+# No restart policy - this is a one-shot orchestrator
+# Individual apps handle their own restarts via daemonctl
+
+[Install]
+WantedBy=default.target

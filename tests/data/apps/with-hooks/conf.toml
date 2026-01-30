@@ -1,0 +1,25 @@
+[daemon]
+name = "with-hooks"
+description = "Daemon demonstrating lifecycle hooks and health checks"
+enabled = true
+
+[process]
+restart = true
+restart_delay = 3
+restart_max_attempts = 5
+start_timeout = 20
+stop_timeout = 10
+
+[logging]
+level = "info"
+
+[pidfile]
+enabled = true
+
+[monitoring]
+enabled = true
+check_interval = 10
+check_timeout = 5
+failure_threshold = 2
+success_threshold = 1
+startup_delay = 5

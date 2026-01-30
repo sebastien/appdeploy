@@ -1,0 +1,15 @@
+[daemon]
+name = "simple-daemon"
+description = "A simple test daemon with heartbeat logging"
+enabled = true
+
+[process]
+restart = false
+start_timeout = 10
+stop_timeout = 5
+
+[logging]
+level = "info"
+
+[pidfile]
+enabled = true

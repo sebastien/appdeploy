@@ -1,0 +1,17 @@
+[daemon]
+name = "runit-style-app"
+description = "Runit-style layout test daemon"
+enabled = true
+
+[process]
+restart = true
+restart_delay = 2
+restart_max_attempts = 3
+start_timeout = 15
+stop_timeout = 10
+
+[logging]
+level = "info"
+
+[pidfile]
+enabled = true

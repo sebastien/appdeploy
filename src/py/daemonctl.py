@@ -40,7 +40,7 @@ from typing import Optional
 # -----------------------------------------------------------------------------
 
 VERSION = "1.0.0"
-DAEMONCTL_PATH = Path(os.environ.get("DAEMONCTL_PATH", os.getcwd()))
+DAEMONCTL_PATH = Path(os.environ.get("DAEMONCTL_PATH", "/opt/apps"))
 DAEMONCTL_CONFIG = os.environ.get("DAEMONCTL_CONFIG", "")
 DAEMONCTL_LOG_LEVEL = os.environ.get("DAEMONCTL_LOG_LEVEL", "info")
 DAEMONCTL_OP_TIMEOUT = int(os.environ.get("DAEMONCTL_OP_TIMEOUT", "30"))
@@ -1193,13 +1193,21 @@ def daemonctl_app_list() -> list[str]:
 			run_subdir = entry / "run"
 			if run_subdir.is_dir():
 				# runit-style: app/run/run or app/run/run.sh
-				if (run_subdir / "run").exists() or (run_subdir / "run.sh").exists():
+				if (run_subdir / "run").is_file() or (run_subdir / "run.sh").is_file():
 					apps.append(entry.name)
 			else:
 				# Simple style: app/run or app/run.sh
-				if (entry / "run").exists() or (entry / "run.sh").exists():
+				if (entry / "run").is_file() or (entry / "run.sh").is_file():
 					apps.append(entry.name)
 	return sorted(apps)
+
+
+# Function: daemonctl_run_dir_active APP_PATH
+# Return True if run/ directory contains a .version file.
+def daemonctl_run_dir_active(app_path: Path) -> bool:
+	"""Check whether run/ directory has a .version marker."""
+	run_dir = app_path / "run"
+	return run_dir.exists() and (run_dir / ".version").is_file()
 
 
 # Function: daemonctl_app_get_run_script APP_NAME
@@ -2054,6 +2062,162 @@ def daemonctl_cmd_restart(args: argparse.Namespace) -> int:
 	return daemonctl_cmd_start(start_args)
 
 
+# Function: daemonctl_cmd_start_all ARGS
+# Start all active applications.
+def daemonctl_cmd_start_all(args: argparse.Namespace) -> int:
+	"""Start all active applications."""
+	only_active = getattr(args, "only_active", False)
+	exclude = getattr(args, "exclude", []) or []
+	timeout = getattr(args, "timeout", 60)
+	verbose = getattr(args, "verbose", False)
+	parallel = getattr(args, "parallel", False)
+
+	apps = daemonctl_app_list()
+
+	if not apps:
+		daemonctl_util_log("info", "No apps found")
+		return 0
+
+	# Filter to only active apps if requested
+	if only_active:
+		apps = [
+			name for name in apps if daemonctl_run_dir_active(daemonctl_app_path(name))
+		]
+
+	if not apps:
+		daemonctl_util_log("info", "No active apps to start")
+		return 0
+
+	# Apply exclusions
+	apps = [name for name in apps if name not in exclude]
+
+	if _dry_run:
+		daemonctl_util_log(
+			"info", f"[dry-run] Would start {len(apps)} apps: {', '.join(apps)}"
+		)
+		return 0
+
+	daemonctl_util_log("info", f"Starting {len(apps)} apps: {', '.join(apps)}")
+
+	failed = []
+	started = []
+
+	for name in apps:
+		# Check if already running
+		status = daemonctl_app_status(name)
+		if status["running"]:
+			if verbose:
+				daemonctl_util_log(
+					"info", f"Skipping {name}: already running (PID: {status['PID']})"
+				)
+			continue
+
+		# Create start args
+		start_args = argparse.Namespace(
+			app_name=name,
+			timeout=timeout,
+			verbose=verbose,
+			wait=False,
+			attach=False,
+			env=None,
+		)
+
+		if verbose:
+			daemonctl_util_log("info", f"Starting {name}...")
+
+		code = daemonctl_cmd_start(start_args)
+		if code == 0:
+			started.append(name)
+		else:
+			failed.append(name)
+			daemonctl_util_log("error", f"Failed to start {name}")
+
+	# Summary
+	if started:
+		daemonctl_util_log("info", f"Started {len(started)} apps: {', '.join(started)}")
+	if failed:
+		daemonctl_util_log(
+			"error", f"Failed to start {len(failed)} apps: {', '.join(failed)}"
+		)
+
+	return 0 if not failed else 1
+
+
+# Function: daemonctl_cmd_stop_all ARGS
+# Stop all running applications.
+def daemonctl_cmd_stop_all(args: argparse.Namespace) -> int:
+	"""Stop all running applications."""
+	exclude = getattr(args, "exclude", []) or []
+	timeout = getattr(args, "timeout", 30)
+	force = getattr(args, "force", False)
+	verbose = getattr(args, "verbose", False)
+	parallel = getattr(args, "parallel", False)
+
+	apps = daemonctl_app_list()
+
+	if not apps:
+		daemonctl_util_log("info", "No apps found")
+		return 0
+
+	# Filter to only running apps
+	running_apps = []
+	for name in apps:
+		status = daemonctl_app_status(name)
+		if status["running"]:
+			running_apps.append(name)
+
+	if not running_apps:
+		daemonctl_util_log("info", "No running apps to stop")
+		return 0
+
+	# Apply exclusions
+	running_apps = [name for name in running_apps if name not in exclude]
+
+	if _dry_run:
+		daemonctl_util_log(
+			"info",
+			f"[dry-run] Would stop {len(running_apps)} apps: {', '.join(running_apps)}",
+		)
+		return 0
+
+	daemonctl_util_log(
+		"info", f"Stopping {len(running_apps)} apps: {', '.join(running_apps)}"
+	)
+
+	failed = []
+	stopped = []
+
+	for name in running_apps:
+		# Create stop args
+		stop_args = argparse.Namespace(
+			app_name=name,
+			timeout=timeout,
+			force=force,
+			signal=None,
+			wait=False,
+		)
+
+		if verbose:
+			daemonctl_util_log("info", f"Stopping {name}...")
+
+		code = daemonctl_cmd_stop(stop_args)
+		if code == 0:
+			stopped.append(name)
+		else:
+			failed.append(name)
+			daemonctl_util_log("error", f"Failed to stop {name}")
+
+	# Summary
+	if stopped:
+		daemonctl_util_log("info", f"Stopped {len(stopped)} apps: {', '.join(stopped)}")
+	if failed:
+		daemonctl_util_log(
+			"error", f"Failed to stop {len(failed)} apps: {', '.join(failed)}"
+		)
+
+	return 0 if not failed else 1
+
+
 # Function: daemonctl_cmd_status ARGS
 # Show status of daemon(s).
 def daemonctl_cmd_status(args: argparse.Namespace) -> int:
@@ -2182,7 +2346,7 @@ def daemonctl_cmd_list(args: argparse.Namespace) -> int:
 	apps = daemonctl_app_list()
 
 	if not apps:
-		daemonctl_util_log("info", "No apps found")
+		daemonctl_util_log("info", f"No apps found in {_base_path}")
 		return 0
 
 	# Header
@@ -2754,6 +2918,59 @@ def daemonctl_CLI_build_parser() -> argparse.ArgumentParser:
 		help="Delay between stop and start",
 	)
 
+	# start-all command
+	p_start_all = subparsers.add_parser("start-all", help="Start all active apps")
+	p_start_all.add_argument(
+		"-a",
+		"--only-active",
+		action="store_true",
+		help="Only start apps with active run/ directory",
+	)
+	p_start_all.add_argument(
+		"-x",
+		"--exclude",
+		action="append",
+		metavar="APP",
+		help="Exclude specific app (can be repeated)",
+	)
+	p_start_all.add_argument(
+		"-t", "--timeout", type=int, default=60, metavar="SEC", help="Timeout per app"
+	)
+	p_start_all.add_argument(
+		"-p",
+		"--parallel",
+		action="store_true",
+		help="Start apps in parallel (default: sequential)",
+	)
+	p_start_all.add_argument(
+		"-V", "--verbose", action="store_true", help="Verbose output"
+	)
+
+	# stop-all command
+	p_stop_all = subparsers.add_parser("stop-all", help="Stop all running apps")
+	p_stop_all.add_argument(
+		"-x",
+		"--exclude",
+		action="append",
+		metavar="APP",
+		help="Exclude specific app (can be repeated)",
+	)
+	p_stop_all.add_argument(
+		"-t", "--timeout", type=int, default=30, metavar="SEC", help="Timeout per app"
+	)
+	p_stop_all.add_argument(
+		"-f", "--force", action="store_true", help="Force kill if needed"
+	)
+	p_stop_all.add_argument(
+		"-p",
+		"--parallel",
+		action="store_true",
+		help="Stop apps in parallel (default: sequential)",
+	)
+	p_stop_all.add_argument(
+		"-V", "--verbose", action="store_true", help="Verbose output"
+	)
+
 	# status command
 	p_status = subparsers.add_parser("status", help="Show app status")
 	p_status.add_argument("app_name", nargs="?", metavar="APP", help="Application name")
@@ -2840,7 +3057,9 @@ def daemonctl_CLI_dispatch(args: argparse.Namespace) -> int:
 	commands = {
 		"run": daemonctl_cmd_run,
 		"start": daemonctl_cmd_start,
+		"start-all": daemonctl_cmd_start_all,
 		"stop": daemonctl_cmd_stop,
+		"stop-all": daemonctl_cmd_stop_all,
 		"restart": daemonctl_cmd_restart,
 		"status": daemonctl_cmd_status,
 		"list": daemonctl_cmd_list,

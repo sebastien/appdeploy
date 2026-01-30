@@ -21,7 +21,9 @@ ${APP_NAME}/
 # Process management
 daemonctl run [OPTIONS] APP_NAME     # Runs as a daemon
 daemonctl start [OPTIONS] APP_NAME   # Start new daemon
+daemonctl start-all [OPTIONS]        # Start all active applications
 daemonctl stop APP_NAME              # Stop daemon by group name
+daemonctl stop-all [OPTIONS]         # Stop all running applications
 daemonctl restart APP_NAME           # Restart daemon
 daemonctl status [APP_NAME]          # Show status of daemon(s)
 daemonctl list                       # List all managed daemons
@@ -174,6 +176,26 @@ Start daemon in background:
 --start-timeout SECONDS      # Timeout for startup (default: 60)
 ```
 
+## Command: `daemonctl start-all [OPTIONS]`
+
+Start all active applications in DAEMONCTL_PATH:
+
+```
+-a, --only-active            # Only start apps with active run/ directory
+-x, --exclude APP            # Exclude specific app (repeatable)
+-t, --timeout SECONDS        # Timeout per app (default: 60)
+-p, --parallel               # Start apps in parallel (default: sequential)
+-V, --verbose                # Verbose output
+```
+
+**Behavior**:
+- Scans DAEMONCTL_PATH for all apps
+- With `--only-active`: only apps whose `run/` directory contains a `.version` file (symlinked or plain)
+- Skips already running apps
+- Starts each app sequentially (or parallel with `--parallel`)
+- Reports success/failure summary at end
+- Exit code: 0=all successful, 1=any failures
+
 ## Command: `daemonctl stop [OPTIONS] APP_NAME`
 
 Stop running daemon:
@@ -185,6 +207,24 @@ Stop running daemon:
 -w, --wait                   # Wait for process to exit
 --remove-pidfile             # Remove PID file after stop
 ```
+
+## Command: `daemonctl stop-all [OPTIONS]`
+
+Stop all running applications in DAEMONCTL_PATH:
+
+```
+-x, --exclude APP            # Exclude specific app (repeatable)
+-t, --timeout SECONDS        # Timeout per app (default: 30)
+-f, --force                  # Force kill if graceful stop fails
+-p, --parallel               # Stop apps in parallel (default: sequential)
+-V, --verbose                # Verbose output
+```
+
+**Behavior**:
+- Scans DAEMONCTL_PATH for all running apps
+- Stops each app sequentially (or parallel with `--parallel`)
+- Reports success/failure summary at end
+- Exit code: 0=all successful, 1=any failures
 
 ## Command: `daemonctl restart [OPTIONS] APP_NAME`
 
