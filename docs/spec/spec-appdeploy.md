@@ -484,6 +484,7 @@ Uploads and unpacks archive to target. Does not activate by default.
 ```
 -y, --yes                    # Skip confirmation (for overwriting existing version)
 --activate                   # Activate after install (implies restart if running)
+--force                      # Overwrite existing regular files when activating
 --keep COUNT                 # Keep only N most recent versions (0=unlimited, default: 5)
 --checksum FILE              # Verify archive against checksum file (sha256)
 ```
@@ -522,6 +523,7 @@ Sets active version by creating symlinks in `run/`.
 
 ```
 --no-restart                 # Don't restart if already running
+--force                      # Overwrite existing regular files with symlinks
 ```
 
 **Version resolution** (when VERSION omitted): Most recently installed
@@ -532,6 +534,19 @@ Sets active version by creating symlinks in `run/`.
 2. Create symlinks in `run/` following layer precedence
 3. Write version string to `run/.version`
 4. Unless `--no-restart`: restart if app was running
+
+**Error handling**:
+
+If a regular file (not a symlink) already exists at a location where a symlink
+would be created, activation fails with an error:
+
+```
+Cannot create symlink /path/to/app/run/config.yaml: a file already exists at that location.
+Use --force to overwrite, or remove the file manually.
+```
+
+This prevents accidentally overwriting user configuration or data files. Use
+`--force` to bypass this safety check.
 
 **Atomicity guarantee:**
 

@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/lib-testing.sh"
 
-DAEMONRUN="$SCRIPT_DIR/daemonrun.sh"
+DAEMONRUN="$SCRIPT_DIR/../src/sh/daemonrun.sh"
 
 # =============================================================================
 # HELPER FUNCTIONS

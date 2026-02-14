@@ -655,8 +655,20 @@ def appdeploy_exec_rm(target: Target, path: str, recursive: bool = False) -> Non
 				p.unlink()
 
 
-def appdeploy_exec_symlink(target: Target, link_path: str, target_path: str) -> None:
-	"""Create symlink on target."""
+def appdeploy_exec_symlink(
+	target: Target, link_path: str, target_path: str, force: bool = False
+) -> None:
+	"""Create symlink on target.
+
+	Args:
+		target: Target to create symlink on.
+		link_path: Path where symlink should be created.
+		target_path: Path the symlink should point to.
+		force: If True, unlink existing files. If False, fail if regular file exists.
+
+	Raises:
+		RuntimeError: If a regular file exists at link_path and force is False.
+	"""
 	appdeploy_util_verbose(f"symlink {link_path} -> {target_path}")
 
 	if _dry_run:
@@ -666,14 +678,38 @@ def appdeploy_exec_symlink(target: Target, link_path: str, target_path: str) -> 
 		return
 
 	if target.is_remote:
-		appdeploy_exec_run(
-			target,
-			f"ln -sf {shlex.quote(target_path)} {shlex.quote(link_path)}",
-			check=True,
-		)
+		if force:
+			appdeploy_exec_run(
+				target,
+				f"ln -sf {shlex.quote(target_path)} {shlex.quote(link_path)}",
+				check=True,
+			)
+		else:
+			result = appdeploy_exec_run(
+				target,
+				f"test -e {shlex.quote(link_path)} && ! test -L {shlex.quote(link_path)} && echo EXISTS || echo OK",
+				check=False,
+			)
+			if "EXISTS" in result.stdout:
+				raise RuntimeError(
+					f"Cannot create symlink {link_path}: a file already exists at that location. "
+					"Use --force to overwrite, or remove the file manually."
+				)
+			appdeploy_exec_run(
+				target,
+				f"ln -sf {shlex.quote(target_path)} {shlex.quote(link_path)}",
+				check=True,
+			)
 	else:
 		link = Path(link_path)
-		if link.exists() or link.is_symlink():
+		if link.is_file():
+			if not force:
+				raise RuntimeError(
+					f"Cannot create symlink {link_path}: a file already exists at that location. "
+					"Use --force to overwrite, or remove the file manually."
+				)
+			link.unlink()
+		elif link.is_symlink():
 			link.unlink()
 		link.symlink_to(target_path)
 
@@ -1099,8 +1135,17 @@ def appdeploy_target_install(
 	pkg: Package,
 	activate: bool = False,
 	keep: int = APPDEPLOY_KEEP_VERSIONS,
+	force: bool = False,
 ) -> None:
-	"""Upload and unpack archive to target."""
+	"""Upload and unpack archive to target.
+
+	Args:
+		target: Target to install to.
+		pkg: Package to install.
+		activate: Whether to activate after install.
+		keep: Number of versions to keep.
+		force: If True, overwrite existing regular files when activating.
+	"""
 	app_dir = str(target.path / pkg.name)
 	packages_dir = f"{app_dir}/packages"
 	dist_dir = f"{app_dir}/dist"
@@ -1129,7 +1174,7 @@ def appdeploy_target_install(
 
 	# Activate if requested
 	if activate:
-		appdeploy_target_activate(target, pkg.name, pkg.version)
+		appdeploy_target_activate(target, pkg.name, pkg.version, force=force)
 
 	# Clean old versions
 	if keep > 0:
@@ -1290,8 +1335,21 @@ def appdeploy_target_activate(
 	name: str,
 	version: Optional[str] = None,
 	no_restart: bool = False,
+	force: bool = False,
 ) -> None:
-	"""Set active version (atomic symlink creation)."""
+	"""Set active version (atomic symlink creation).
+
+	Args:
+		target: Target to activate version on.
+		name: Package name.
+		version: Version to activate (latest if not specified).
+		no_restart: If True, don't restart if was running.
+		force: If True, overwrite existing regular files with symlinks.
+
+	Raises:
+		ValueError: If version not found.
+		RuntimeError: If a regular file exists at symlink location and force is False.
+	"""
 	app_dir = str(target.path / name)
 	dist_dir = f"{app_dir}/dist"
 	run_dir = f"{app_dir}/run"
@@ -1325,7 +1383,7 @@ def appdeploy_target_activate(
 	# Create run.new with layer symlinks
 	appdeploy_exec_rm(target, run_new, recursive=True)
 	appdeploy_exec_mkdir(target, run_new)
-	appdeploy_target_populate_run(target, name, version, run_new)
+	appdeploy_target_populate_run(target, name, version, run_new, force)
 
 	# Write version file
 	if target.is_remote:
@@ -1373,11 +1431,21 @@ def appdeploy_target_deactivate(target: Target, name: str) -> None:
 
 
 def appdeploy_target_populate_run(
-	target: Target, name: str, version: str, run_dir: str
+	target: Target, name: str, version: str, run_dir: str, force: bool = False
 ) -> None:
 	"""Populate run/ directory with layer symlinks.
 
 	Layer order (last wins): dist/ -> data/ -> conf/ -> logs symlink
+
+	Args:
+		target: Target to populate run directory on.
+		name: Package name.
+		version: Version to use.
+		run_dir: Path to run directory to populate.
+		force: If True, overwrite existing regular files with symlinks.
+
+	Raises:
+		RuntimeError: If a regular file exists at symlink location and force is False.
 	"""
 	app_dir = str(target.path / name)
 	dist_dir = f"{app_dir}/dist/{version}"
@@ -1401,27 +1469,22 @@ def appdeploy_target_populate_run(
 	for entry in list_entries(dist_dir):
 		src = f"../dist/{version}/{entry}"
 		dst = f"{run_dir}/{entry}"
-		appdeploy_exec_symlink(target, dst, src)
+		appdeploy_exec_symlink(target, dst, src, force)
 
 	# Layer 2: data (symlinks to preserve write capability)
 	for entry in list_entries(data_dir):
 		dst = f"{run_dir}/{entry}"
-		# Remove existing if present
-		if appdeploy_exec_exists(target, dst):
-			appdeploy_exec_rm(target, dst, recursive=False)
 		src = f"../data/{entry}"
-		appdeploy_exec_symlink(target, dst, src)
+		appdeploy_exec_symlink(target, dst, src, force)
 
 	# Layer 3: conf (symlinks, highest priority)
 	for entry in list_entries(conf_dir):
 		dst = f"{run_dir}/{entry}"
-		if appdeploy_exec_exists(target, dst):
-			appdeploy_exec_rm(target, dst, recursive=False)
 		src = f"../conf/{entry}"
-		appdeploy_exec_symlink(target, dst, src)
+		appdeploy_exec_symlink(target, dst, src, force)
 
 	# Always add logs symlink
-	appdeploy_exec_symlink(target, f"{run_dir}/logs", "../logs")
+	appdeploy_exec_symlink(target, f"{run_dir}/logs", "../logs", force)
 
 
 def appdeploy_target_list(
@@ -2100,29 +2163,47 @@ def appdeploy_cmd_run_local(
 				else:
 					shutil.copy2(item, sim_conf_dir / item.name)
 
-		# Populate run directory with layers
-		# Layer 1: dist
-		for item in dist_dir.iterdir():
-			(sim_run_dir / item.name).symlink_to(f"../dist/current/{item.name}")
+	# Populate run directory with layers
+	# Layer 1: dist
+	for item in dist_dir.iterdir():
+		link = sim_run_dir / item.name
+		if link.is_file():
+			raise RuntimeError(
+				f"Cannot create symlink {link}: a file already exists at that location."
+			)
+		link.symlink_to(f"../dist/current/{item.name}")
 
-		# Layer 2: data (overwrite)
-		for item in sim_data_dir.iterdir():
-			link = sim_run_dir / item.name
-			if link.exists() or link.is_symlink():
-				link.unlink()
-			link.symlink_to(f"../data/{item.name}")
+	# Layer 2: data (overwrite)
+	for item in sim_data_dir.iterdir():
+		link = sim_run_dir / item.name
+		if link.is_file():
+			raise RuntimeError(
+				f"Cannot create symlink {link}: a file already exists at that location."
+			)
+		elif link.is_symlink():
+			link.unlink()
+		link.symlink_to(f"../data/{item.name}")
 
-		# Layer 3: conf (overwrite)
-		for item in sim_conf_dir.iterdir():
-			link = sim_run_dir / item.name
-			if link.exists() or link.is_symlink():
-				link.unlink()
-			link.symlink_to(f"../conf/{item.name}")
+	# Layer 3: conf (overwrite)
+	for item in sim_conf_dir.iterdir():
+		link = sim_run_dir / item.name
+		if link.is_file():
+			raise RuntimeError(
+				f"Cannot create symlink {link}: a file already exists at that location."
+			)
+		elif link.is_symlink():
+			link.unlink()
+		link.symlink_to(f"../conf/{item.name}")
 
-		# logs symlink
-		(sim_run_dir / "logs").symlink_to("../logs")
+	# logs symlink
+	link = sim_run_dir / "logs"
+	if link.is_file():
+		raise RuntimeError(
+			f"Cannot create symlink {link}: a file already exists at that location."
+		)
+	link.symlink_to("../logs")
 
-		run_dir = sim_run_dir
+	run_dir = sim_run_dir
 
 	# Find run script
 	run_script = None
@@ -2308,6 +2389,11 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 		"--activate", action="store_true", help="Activate after install"
 	)
 	p_install.add_argument(
+		"--force",
+		action="store_true",
+		help="Overwrite existing regular files when activating",
+	)
+	p_install.add_argument(
 		"--keep",
 		type=int,
 		default=APPDEPLOY_KEEP_VERSIONS,
@@ -2331,6 +2417,9 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_activate.add_argument("version", nargs="?", help="Version (or use name:version)")
 	p_activate.add_argument(
 		"--no-restart", action="store_true", help="Don't restart if running"
+	)
+	p_activate.add_argument(
+		"--force", action="store_true", help="Overwrite existing regular files"
 	)
 
 	# deactivate
@@ -2716,6 +2805,7 @@ def appdeploy_cmd_handler_install(args: argparse.Namespace) -> int:
 			pkg,
 			activate=args.activate,
 			keep=args.keep,
+			force=args.force,
 		)
 		appdeploy_util_log_op(f"Installed {pkg.name}:{pkg.version}")
 		return 0
@@ -2796,7 +2886,9 @@ def appdeploy_cmd_handler_activate(args: argparse.Namespace) -> int:
 					"Version specified twice (both in package:version and as argument)"
 				)
 			version = args.version
-		appdeploy_target_activate(target, name, version, no_restart=args.no_restart)
+		appdeploy_target_activate(
+			target, name, version, no_restart=args.no_restart, force=args.force
+		)
 		return 0
 	except Exception as e:
 		appdeploy_util_error(str(e))
