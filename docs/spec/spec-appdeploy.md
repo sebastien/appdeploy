@@ -484,7 +484,7 @@ Uploads and unpacks archive to target. Does not activate by default.
 ```
 -y, --yes                    # Skip confirmation (for overwriting existing version)
 --activate                   # Activate after install (implies restart if running)
---force                      # Overwrite existing regular files when activating
+--force                      # Reinstall same version and overwrite regular files when activating
 --keep COUNT                 # Keep only N most recent versions (0=unlimited, default: 5)
 --checksum FILE              # Verify archive against checksum file (sha256)
 ```
@@ -494,7 +494,8 @@ Uploads and unpacks archive to target. Does not activate by default.
 2. Bootstrap tools if not present on target
 3. Upload archive to `${TARGET}/${NAME}/packages/`
 4. Unpack to `${TARGET}/${NAME}/dist/${VERSION}/`
-5. If `--activate`: activate the installed version (see `activate` command)
+5. If the same version already exists: fail unless `--force` is set
+6. If `--activate`: activate the installed version (see `activate` command)
 
 **Note:** To install and immediately run, use `upgrade` instead, which provides
 atomic deployment with health checks and automatic rollback.

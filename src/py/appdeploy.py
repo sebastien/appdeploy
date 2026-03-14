@@ -1144,12 +1144,24 @@ def appdeploy_target_install(
 		pkg: Package to install.
 		activate: Whether to activate after install.
 		keep: Number of versions to keep.
-		force: If True, overwrite existing regular files when activating.
+		force: If True, allow same-version reinstall and overwrite existing
+			regular files when activating.
 	"""
 	app_dir = str(target.path / pkg.name)
 	packages_dir = f"{app_dir}/packages"
 	dist_dir = f"{app_dir}/dist"
 	version_dir = f"{dist_dir}/{pkg.version}"
+	run_dir = f"{app_dir}/run"
+	version_exists = appdeploy_exec_exists(target, version_dir)
+	active_version = None
+	if appdeploy_exec_exists(target, f"{run_dir}/.version"):
+		active_version = appdeploy_exec_read(target, f"{run_dir}/.version").strip()
+
+	if version_exists and not force:
+		raise RuntimeError(
+			f"Version {pkg.name}:{pkg.version} is already installed. "
+			"Use --force to reinstall it."
+		)
 
 	# Ensure directories exist
 	appdeploy_exec_mkdir(target, packages_dir)
@@ -1168,13 +1180,35 @@ def appdeploy_target_install(
 				is_archive=True,
 				config=pkg.config,
 			)
-			_do_install(target, pkg, packages_dir, version_dir)
+			_do_install(
+				target,
+				pkg,
+				packages_dir,
+				version_dir,
+				replace_existing=version_exists,
+				atomic_swap=active_version == pkg.version,
+			)
 	else:
-		_do_install(target, pkg, packages_dir, version_dir)
+		_do_install(
+			target,
+			pkg,
+			packages_dir,
+			version_dir,
+			replace_existing=version_exists,
+			atomic_swap=active_version == pkg.version,
+		)
 
 	# Activate if requested
 	if activate:
-		appdeploy_target_activate(target, pkg.name, pkg.version, force=force)
+		if active_version == pkg.version and version_exists and force:
+			if appdeploy_exec_exists(target, f"{run_dir}/.pid"):
+				appdeploy_daemon_restart(target, pkg.name, force=force)
+			else:
+				appdeploy_util_log_op(
+					f"{pkg.name}:{pkg.version} content refreshed", version=pkg.version
+				)
+		else:
+			appdeploy_target_activate(target, pkg.name, pkg.version, force=force)
 
 	# Clean old versions
 	if keep > 0:
@@ -1182,19 +1216,31 @@ def appdeploy_target_install(
 
 
 def _do_install(
-	target: Target, pkg: Package, packages_dir: str, version_dir: str
+	target: Target,
+	pkg: Package,
+	packages_dir: str,
+	version_dir: str,
+	replace_existing: bool = False,
+	atomic_swap: bool = False,
 ) -> None:
 	"""Internal: perform actual install of archive."""
 	archive_name = pkg.path.name
 	remote_archive = f"{packages_dir}/{archive_name}"
+	staging_dir = f"{version_dir}.new"
+	backup_dir = f"{version_dir}.old"
+
+	def extract_archive(dst_dir: str) -> None:
+		appdeploy_util_log_op(f"Extracting to {dst_dir}")
+		appdeploy_exec_mkdir(target, dst_dir)
+		appdeploy_exec_run(
+			target,
+			f"tar -x{tar_flag}f {shlex.quote(remote_archive)} -C {shlex.quote(dst_dir)} --strip-components=0",
+			check=True,
+		)
 
 	# Upload archive
 	appdeploy_util_log_op(f"Uploading {archive_name}")
 	appdeploy_exec_copy(target, pkg.path, remote_archive)
-
-	# Extract to version directory
-	appdeploy_util_log_op(f"Extracting to {version_dir}")
-	appdeploy_exec_mkdir(target, version_dir)
 
 	# Determine tar flags based on compression
 	if archive_name.endswith(".tar.gz") or archive_name.endswith(".tgz"):
@@ -1206,11 +1252,26 @@ def _do_install(
 	else:
 		tar_flag = ""
 
-	appdeploy_exec_run(
-		target,
-		f"tar -x{tar_flag}f {shlex.quote(remote_archive)} -C {shlex.quote(version_dir)} --strip-components=0",
-		check=True,
-	)
+	if replace_existing:
+		if atomic_swap:
+			appdeploy_exec_rm(target, staging_dir, recursive=True)
+			appdeploy_exec_rm(target, backup_dir, recursive=True)
+			extract_archive(staging_dir)
+			appdeploy_exec_rename(target, version_dir, backup_dir)
+			try:
+				appdeploy_exec_rename(target, staging_dir, version_dir)
+			except Exception:
+				if appdeploy_exec_exists(
+					target, backup_dir
+				) and not appdeploy_exec_exists(target, version_dir):
+					appdeploy_exec_rename(target, backup_dir, version_dir)
+				raise
+			appdeploy_exec_rm(target, backup_dir, recursive=True)
+		else:
+			appdeploy_exec_rm(target, version_dir, recursive=True)
+			extract_archive(version_dir)
+	else:
+		extract_archive(version_dir)
 
 
 def appdeploy_target_uninstall(
@@ -2391,7 +2452,8 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 	p_install.add_argument(
 		"--force",
 		action="store_true",
-		help="Overwrite existing regular files when activating",
+		default=argparse.SUPPRESS,
+		help="Reinstall same version and overwrite regular files when activating",
 	)
 	p_install.add_argument(
 		"--keep",
@@ -2419,7 +2481,10 @@ def appdeploy_build_parser() -> argparse.ArgumentParser:
 		"--no-restart", action="store_true", help="Don't restart if running"
 	)
 	p_activate.add_argument(
-		"--force", action="store_true", help="Overwrite existing regular files"
+		"--force",
+		action="store_true",
+		default=argparse.SUPPRESS,
+		help="Overwrite existing regular files",
 	)
 
 	# deactivate
